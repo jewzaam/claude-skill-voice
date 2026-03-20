@@ -42,3 +42,6 @@ dev = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["scripts*"]
+
+[tool.mypy]
+ignore_missing_imports = true

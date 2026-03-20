@@ -14,7 +14,7 @@ import pytest
 # Add scripts to path so we can import voice
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
-import voice
+import voice  # noqa: E402
 
 
 class TestTruncatePath:
