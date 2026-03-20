@@ -112,9 +112,7 @@ def record_with_gui(cwd: str, *, device_id: int | None = None) -> np.ndarray:
     status_label.pack()
 
     elapsed_var = tk.StringVar(value="0:00")
-    tk.Label(frame, textvariable=elapsed_var, font=("monospace", 24)).pack(
-        pady=(10, 5)
-    )
+    tk.Label(frame, textvariable=elapsed_var, font=("monospace", 24)).pack(pady=(10, 5))
 
     display_cwd = _truncate_path(cwd)
     tk.Label(frame, text=display_cwd, font=("monospace", 9), fg="#666666").pack(

@@ -165,9 +165,7 @@ def _mock_tk(*, num_devices=0):
         "root": mock_root,
     }
     if num_devices > 1:
-        patches["combobox"] = patch(
-            "voice.ttk.Combobox", return_value=MagicMock()
-        )
+        patches["combobox"] = patch("voice.ttk.Combobox", return_value=MagicMock())
     return patches
 
 
@@ -289,14 +287,10 @@ class TestRecordWithGui:
         ]
 
         with contextlib.ExitStack() as stack:
-            stack.enter_context(
-                patch("voice.sd.InputStream", return_value=mock_stream)
-            )
+            stack.enter_context(patch("voice.sd.InputStream", return_value=mock_stream))
             for p in _apply_tk_patches(tk_mocks):
                 stack.enter_context(p)
-            stack.enter_context(
-                patch("voice._get_input_devices", return_value=devices)
-            )
+            stack.enter_context(patch("voice._get_input_devices", return_value=devices))
             with pytest.raises(voice.RecordingError):
                 voice.record_with_gui("/tmp")
 
@@ -477,6 +471,4 @@ class TestMain:
         ):
             voice.main()
 
-        mock_record.assert_called_once_with(
-            os.getcwd(), device_id=5
-        )
+        mock_record.assert_called_once_with(os.getcwd(), device_id=5)
