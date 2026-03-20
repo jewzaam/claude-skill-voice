@@ -11,8 +11,9 @@ Record audio from the user's microphone, transcribe it locally, and treat the tr
 
 1. **Run the voice script** via Bash:
    ```
-   python3 <skill_base_dir>/scripts/voice.py
+   python3 <skill_base_dir>/scripts/voice.py 2>/dev/null
    ```
+   - `2>/dev/null` suppresses stderr because the Bash tool merges stderr into stdout, which would mix progress messages ("Captured 9.6s...", "Transcribing...") into the transcript.
    - Replace `<skill_base_dir>` with the directory containing this SKILL.md file.
    - Optional flags:
      - `--model tiny|base|small` (default: `base`). Use the model the user specifies, or `base` if unspecified.
