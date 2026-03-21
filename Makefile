@@ -2,15 +2,10 @@
 
 .PHONY: check install install-dev install-no-deps uninstall clean format lint typecheck test test-verbose coverage
 
-# Normalize HOME to forward slashes (no-op on Unix, fixes Windows backslashes)
-HOME_DIR := $(subst \,/,$(HOME))
-
-# Use shared ~/.venv/ap if it exists, otherwise local .venv
+VENV_DIR ?= .venv
 ifeq ($(OS),Windows_NT)
-    VENV_DIR ?= $(if $(wildcard $(HOME_DIR)/.venv/ap/Scripts/python.exe),$(HOME_DIR)/.venv/ap,.venv)
     PYTHON := $(VENV_DIR)/Scripts/python.exe
 else
-    VENV_DIR ?= $(if $(wildcard $(HOME_DIR)/.venv/ap/bin/python),$(HOME_DIR)/.venv/ap,.venv)
     PYTHON := $(VENV_DIR)/bin/python
 endif
 
