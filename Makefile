@@ -2,7 +2,7 @@
 
 .PHONY: check install install-dev install-no-deps uninstall clean format lint typecheck test test-verbose coverage
 
-VENV_DIR ?= .venv
+VENV_DIR ?= $(subst \,/,$(HOME))/.claude/venvs/voice
 ifeq ($(OS),Windows_NT)
     PYTHON := $(VENV_DIR)/Scripts/python.exe
 else

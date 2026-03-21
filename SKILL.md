@@ -11,9 +11,9 @@ Record audio from the user's microphone, transcribe it locally, and treat the tr
 
 1. **Run the voice script** via Bash with `run_in_background: true` (recording has no time limit — the user controls when to stop via the GUI):
    ```
-   <skill_base_dir>/.venv/bin/python <skill_base_dir>/scripts/voice.py 2>/dev/null
+   ~/.claude/venvs/voice/bin/python <skill_base_dir>/scripts/voice.py 2>/dev/null
    ```
-   - On Windows, use `.venv/Scripts/python.exe` instead of `.venv/bin/python`.
+   - On Windows, use `~/.claude/venvs/voice/Scripts/python.exe` instead of the Unix path above.
    - Use `run_in_background: true` on the Bash tool call. This avoids the 2-minute default timeout killing long recordings. You will be notified when the recording finishes.
    - `2>/dev/null` suppresses stderr because the Bash tool merges stderr into stdout, which would mix progress messages ("Captured 9.6s...", "Transcribing...") into the transcript.
    - Replace `<skill_base_dir>` with the directory containing this SKILL.md file.

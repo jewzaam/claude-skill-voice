@@ -6,7 +6,7 @@ Claude Code skill that provides voice-to-text input via `/voice`. Records audio 
 
 ## Tech Stack
 
-- **Python 3.10+** with venv at `.venv/`
+- **Python 3.10+** with venv at `~/.claude/venvs/voice`
 - **faster-whisper** for local Whisper transcription (CPU, int8)
 - **sounddevice** for microphone capture
 - **tkinter** for the recording GUI
@@ -46,4 +46,4 @@ make coverage       # pytest --cov
 
 ## Deployment
 
-Installed as a git submodule in `~/.claude/skills/voice`. The skill is globally available across all Claude Code sessions.
+Installed in `~/.claude/skills/voice`. The skill is globally available across all Claude Code sessions.
