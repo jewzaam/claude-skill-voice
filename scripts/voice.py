@@ -6,7 +6,7 @@ Records audio from microphone, transcribes locally with faster-whisper.
 Cross-platform: Linux (Fedora) and Windows 11.
 
 A tkinter popup shows recording status with elapsed time and cwd context.
-Supports pause/resume, input device selection, and stop to end recording.
+Supports pause/resume and cancel/done controls.
 
 Usage:
     python3 voice.py [--model tiny|base|small] [--device DEVICE_ID]
@@ -14,6 +14,8 @@ Usage:
 """
 
 import argparse
+import json
+import logging
 import os
 import sys
 import tempfile
@@ -23,7 +25,6 @@ import wave
 
 try:
     import tkinter as tk
-    from tkinter import ttk
 except ModuleNotFoundError:
     print(
         "Error: tkinter not found. Install it with:\n"
@@ -38,19 +39,120 @@ import numpy as np
 import sounddevice as sd
 from faster_whisper import WhisperModel
 
+log = logging.getLogger(__name__)
+
+APP_NAME = "claude-skill-voice"
+CONFIG_FILENAME = "settings.json"
+CONFIG_KEY_WINDOW_X = "window_x"
+CONFIG_KEY_WINDOW_Y = "window_y"
+
 SAMPLE_RATE = 16000
+AUDIO_CHANNELS = 1
+AUDIO_DTYPE = "int16"
+AUDIO_SAMPLE_WIDTH = 2
+DEFAULT_MODEL_SIZE = "base"
+WHISPER_BEAM_SIZE = 5
+WHISPER_DEVICE = "cpu"
+WHISPER_COMPUTE_TYPE = "int8"
+
 MAX_PATH_DISPLAY_LENGTH = 60
 TIMER_UPDATE_MS = 200
+
+COLOR_RECORDING = "#cc0000"
+COLOR_RECORDING_ACTIVE = "#990000"
+COLOR_PAUSED = "#cc8800"
+COLOR_PAUSED_ACTIVE = "#996600"
+COLOR_DONE = "#228B22"
+COLOR_DONE_ACTIVE = "#1a6b1a"
+COLOR_MUTED = "#666666"
+
+FONT_STATUS = ("sans-serif", 16, "bold")
+FONT_TIMER = ("monospace", 24)
+FONT_DETAIL = ("monospace", 9)
+FONT_BUTTON = ("sans-serif", 12)
+
+
+def _config_path() -> str:
+    """Return the path to the settings JSON file, platform-appropriate."""
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA", os.path.expanduser("~"))
+    else:
+        base = os.environ.get(
+            "XDG_CONFIG_HOME", os.path.join(os.path.expanduser("~"), ".config")
+        )
+    return os.path.join(base, APP_NAME, CONFIG_FILENAME)
+
+
+def _load_window_pos() -> tuple[int | None, int | None]:
+    """Load saved window position from config. Returns (x, y) or (None, None)."""
+    path = _config_path()
+    if not os.path.exists(path):
+        return None, None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        raw_x = data.get(CONFIG_KEY_WINDOW_X)
+        raw_y = data.get(CONFIG_KEY_WINDOW_Y)
+        x = int(raw_x) if isinstance(raw_x, (int, float)) else None
+        y = int(raw_y) if isinstance(raw_y, (int, float)) else None
+        if x is not None and y is not None:
+            return x, y
+    except (json.JSONDecodeError, OSError, ValueError):
+        pass
+    return None, None
+
+
+def _save_window_pos(x: int, y: int) -> None:
+    """Save window position to config file with atomic write."""
+    path = _config_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    data: dict = {}
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    data[CONFIG_KEY_WINDOW_X] = x
+    data[CONFIG_KEY_WINDOW_Y] = y
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
 
 
 class RecordingError(Exception):
     """Raised when audio recording fails."""
 
 
+class RecordingCancelled(Exception):
+    """Raised when the user cancels recording."""
+
+
+def _home_relative_path(path: str) -> str:
+    """Convert an absolute path to ~/relative form."""
+    home = os.path.expanduser("~")
+    if path == home or path.startswith(home + os.sep):
+        return "~" + path[len(home) :]
+    return path
+
+
 def _truncate_path(path: str, *, max_length: int = MAX_PATH_DISPLAY_LENGTH) -> str:
     if len(path) > max_length:
         return "..." + path[-(max_length - 3) :]
     return path
+
+
+def _get_default_input_device() -> int:
+    """Return the sounddevice index of the system default input device."""
+    default = sd.default.device[0]
+    if default is None or default < 0:
+        devices = sd.query_devices()
+        for i, dev in enumerate(devices):
+            if dev["max_input_channels"] > 0:
+                return i
+        raise RecordingError("No input devices found.")
+    return int(default)
 
 
 def _get_input_devices() -> list[dict]:
@@ -67,29 +169,45 @@ def record_with_gui(cwd: str, *, device_id: int | None = None) -> np.ndarray:
 
     Raises:
         RecordingError: If no audio was captured.
+        RecordingCancelled: If the user cancelled recording.
     """
+    if device_id is None:
+        device_id = _get_default_input_device()
+        log.debug("resolved default input device: %d", device_id)
+
     chunks: list[np.ndarray] = []
     recording = True
     paused = False
+    cancelled = False
     start_time = time.time()
     paused_elapsed = 0.0
     pause_start = 0.0
 
-    def audio_callback(indata, _frames, _time_info, _status):
+    callback_count = [0]
+
+    def audio_callback(indata, _frames, _time_info, status):
+        callback_count[0] += 1
+        if status:
+            log.warning("audio_callback status: %s", status)
         if recording and not paused:
             chunks.append(indata.copy())
-
-    stream_kwargs: dict = {
-        "samplerate": SAMPLE_RATE,
-        "channels": 1,
-        "dtype": "int16",
-        "callback": audio_callback,
-    }
-    if device_id is not None:
-        stream_kwargs["device"] = device_id
+            if callback_count[0] % 50 == 0:
+                peak = int(np.max(np.abs(indata)))
+                log.debug(
+                    "callback #%d, chunks=%d, peak=%d",
+                    callback_count[0],
+                    len(chunks),
+                    peak,
+                )
 
     try:
-        stream = sd.InputStream(**stream_kwargs)
+        stream = sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=AUDIO_CHANNELS,
+            dtype=AUDIO_DTYPE,
+            callback=audio_callback,
+            device=device_id,
+        )
     except Exception as e:
         print(f"Failed to access microphone: {e}", file=sys.stderr)
         sys.exit(1)
@@ -99,6 +217,10 @@ def record_with_gui(cwd: str, *, device_id: int | None = None) -> np.ndarray:
     root.attributes("-topmost", True)
     root.resizable(False, False)
 
+    saved_x, saved_y = _load_window_pos()
+    if saved_x is not None and saved_y is not None:
+        root.geometry(f"+{saved_x}+{saved_y}")
+
     frame = tk.Frame(root, padx=20, pady=15)
     frame.pack()
 
@@ -106,67 +228,37 @@ def record_with_gui(cwd: str, *, device_id: int | None = None) -> np.ndarray:
     status_label = tk.Label(
         frame,
         textvariable=status_var,
-        font=("sans-serif", 16, "bold"),
-        fg="#cc0000",
+        font=FONT_STATUS,
+        fg=COLOR_RECORDING,
     )
     status_label.pack()
 
     elapsed_var = tk.StringVar(value="0:00")
-    tk.Label(frame, textvariable=elapsed_var, font=("monospace", 24)).pack(pady=(10, 5))
+    tk.Label(frame, textvariable=elapsed_var, font=FONT_TIMER).pack(pady=(10, 5))
 
-    display_cwd = _truncate_path(cwd)
-    tk.Label(frame, text=display_cwd, font=("monospace", 9), fg="#666666").pack(
+    display_cwd = _truncate_path(_home_relative_path(cwd))
+    tk.Label(frame, text=display_cwd, font=FONT_DETAIL, fg=COLOR_MUTED).pack()
+
+    device_name = sd.query_devices(device_id)["name"]
+    tk.Label(frame, text=f"Mic: {device_name}", font=FONT_DETAIL, fg=COLOR_MUTED).pack(
         pady=(0, 10)
     )
 
-    # Input device selector
-    input_devices = _get_input_devices()
-    if len(input_devices) > 1:
-        device_frame = tk.Frame(frame)
-        device_frame.pack(pady=(0, 10))
-        tk.Label(device_frame, text="Input:", font=("sans-serif", 9)).pack(side=tk.LEFT)
-        device_names = [d["name"] for d in input_devices]
-        device_combo = ttk.Combobox(
-            device_frame,
-            values=device_names,
-            state="readonly",
-            width=30,
-        )
-        # Select current device
-        current_idx = 0
-        if device_id is not None:
-            for i, d in enumerate(input_devices):
-                if d["id"] == device_id:
-                    current_idx = i
-                    break
-        device_combo.current(current_idx)
-        device_combo.pack(side=tk.LEFT, padx=(5, 0))
-
-        def on_device_change(_event):
-            nonlocal stream, device_id
-            selected_idx = device_combo.current()
-            new_device_id = input_devices[selected_idx]["id"]
-            if new_device_id == device_id:
-                return
-            device_id = new_device_id
-            stream.stop()
-            stream.close()
-            try:
-                stream = sd.InputStream(
-                    samplerate=SAMPLE_RATE,
-                    channels=1,
-                    dtype="int16",
-                    callback=audio_callback,
-                    device=device_id,
-                )
-                stream.start()
-            except Exception as e:
-                status_var.set(f"Device error: {e}")
-
-        device_combo.bind("<<ComboboxSelected>>", on_device_change)
-
     button_frame = tk.Frame(frame)
     button_frame.pack()
+
+    def _save_pos_and_destroy():
+        try:
+            _save_window_pos(root.winfo_x(), root.winfo_y())
+        except Exception:
+            pass
+        root.destroy()
+
+    def cancel_recording():
+        nonlocal recording, cancelled
+        recording = False
+        cancelled = True
+        _save_pos_and_destroy()
 
     def toggle_pause():
         nonlocal paused, pause_start, paused_elapsed
@@ -174,48 +266,66 @@ def record_with_gui(cwd: str, *, device_id: int | None = None) -> np.ndarray:
             paused_elapsed += time.time() - pause_start
             paused = False
             status_var.set("Recording...")
-            status_label.config(fg="#cc0000")
+            status_label.config(fg=COLOR_RECORDING)
             pause_btn.config(text="Pause")
             update_timer()
         else:
             pause_start = time.time()
             paused = True
             status_var.set("Paused")
-            status_label.config(fg="#cc8800")
+            status_label.config(fg=COLOR_PAUSED)
             pause_btn.config(text="Resume")
+
+    def done_recording():
+        nonlocal recording
+        recording = False
+        _save_pos_and_destroy()
+
+    cancel_btn = tk.Button(
+        button_frame,
+        text="Cancel",
+        font=FONT_BUTTON,
+        command=cancel_recording,
+        bg=COLOR_RECORDING,
+        fg="white",
+        activebackground=COLOR_RECORDING_ACTIVE,
+        activeforeground="white",
+        padx=15,
+        pady=5,
+    )
+    cancel_btn.pack(side=tk.LEFT, padx=(0, 5))
 
     pause_btn = tk.Button(
         button_frame,
         text="Pause",
-        font=("sans-serif", 12),
+        font=FONT_BUTTON,
         command=toggle_pause,
-        bg="#cc8800",
+        bg=COLOR_PAUSED,
         fg="white",
-        activebackground="#996600",
+        activebackground=COLOR_PAUSED_ACTIVE,
         activeforeground="white",
         padx=15,
         pady=5,
     )
     pause_btn.pack(side=tk.LEFT, padx=(0, 5))
 
-    def stop_recording():
-        nonlocal recording
-        recording = False
-        root.destroy()
-
-    stop_btn = tk.Button(
+    done_btn = tk.Button(
         button_frame,
-        text="Stop",
-        font=("sans-serif", 12),
-        command=stop_recording,
-        bg="#cc0000",
+        text="Done",
+        font=FONT_BUTTON,
+        command=done_recording,
+        bg=COLOR_DONE,
         fg="white",
-        activebackground="#990000",
+        activebackground=COLOR_DONE_ACTIVE,
         activeforeground="white",
         padx=15,
         pady=5,
     )
-    stop_btn.pack(side=tk.LEFT)
+    done_btn.pack(side=tk.LEFT)
+
+    root.bind("<Escape>", lambda _e: cancel_recording())
+    root.bind("<space>", lambda _e: toggle_pause())
+    root.bind("<Return>", lambda _e: done_recording())
 
     def update_timer():
         if recording and not paused:
@@ -224,7 +334,7 @@ def record_with_gui(cwd: str, *, device_id: int | None = None) -> np.ndarray:
             elapsed_var.set(f"{mins}:{secs:02d}")
             root.after(TIMER_UPDATE_MS, update_timer)
 
-    root.protocol("WM_DELETE_WINDOW", stop_recording)
+    root.protocol("WM_DELETE_WINDOW", cancel_recording)
 
     try:
         stream.start()
@@ -233,6 +343,16 @@ def record_with_gui(cwd: str, *, device_id: int | None = None) -> np.ndarray:
     finally:
         stream.stop()
         stream.close()
+
+    log.debug(
+        "recording ended: chunks=%d, callback_count=%d, cancelled=%s",
+        len(chunks),
+        callback_count[0],
+        cancelled,
+    )
+
+    if cancelled:
+        raise RecordingCancelled("Recording cancelled.")
 
     if not chunks:
         raise RecordingError("No audio captured.")
@@ -248,18 +368,20 @@ def save_wav(audio_data: np.ndarray) -> str:
     file_id = uuid.uuid4().hex[:8]
     wav_path = os.path.join(tempfile.gettempdir(), f"claude_voice_{file_id}.wav")
     with wave.open(wav_path, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
+        wf.setnchannels(AUDIO_CHANNELS)
+        wf.setsampwidth(AUDIO_SAMPLE_WIDTH)
         wf.setframerate(SAMPLE_RATE)
         wf.writeframes(audio_data.tobytes())
     return wav_path
 
 
-def transcribe(wav_path: str, *, model_size: str = "base") -> str:
+def transcribe(wav_path: str, *, model_size: str = DEFAULT_MODEL_SIZE) -> str:
     """Transcribe WAV file using faster-whisper."""
     print(f"Transcribing with model '{model_size}'...", file=sys.stderr)
     try:
-        model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        model = WhisperModel(
+            model_size, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE
+        )
     except Exception as e:
         print(
             f"Failed to load Whisper model '{model_size}': {e}\n"
@@ -268,7 +390,7 @@ def transcribe(wav_path: str, *, model_size: str = "base") -> str:
             file=sys.stderr,
         )
         raise
-    segments, _ = model.transcribe(wav_path, beam_size=5)
+    segments, _ = model.transcribe(wav_path, beam_size=WHISPER_BEAM_SIZE)
     text_parts = [seg.text.strip() for seg in segments]
     return " ".join(text_parts).strip()
 
@@ -278,7 +400,7 @@ def main() -> None:
     parser.add_argument(
         "--model",
         type=str,
-        default="base",
+        default=DEFAULT_MODEL_SIZE,
         choices=["tiny", "base", "small"],
         help="Whisper model size (default: base)",
     )
@@ -293,7 +415,18 @@ def main() -> None:
         action="store_true",
         help="List available audio input devices and exit",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging to stderr",
+    )
     args = parser.parse_args()
+
+    if args.debug:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+        log.addHandler(handler)
+        log.setLevel(logging.DEBUG)
 
     if args.list_devices:
         devices = _get_input_devices()
@@ -307,6 +440,8 @@ def main() -> None:
     cwd = os.getcwd()
     try:
         audio_data = record_with_gui(cwd, device_id=args.device)
+    except RecordingCancelled:
+        sys.exit(1)
     except RecordingError as e:
         print(str(e), file=sys.stderr)
         sys.exit(1)
