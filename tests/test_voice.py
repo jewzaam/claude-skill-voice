@@ -66,80 +66,121 @@ class TestConfigPath:
         assert result.startswith("C:\\Users\\user\\AppData\\Roaming")
 
 
-class TestLoadWindowPos:
-    def test_returns_none_when_no_file(self, tmp_path):
-        with patch(
-            "voice._config_path", return_value=str(tmp_path / "nonexistent.json")
-        ):
-            assert voice._load_window_pos() == (None, None)
+class TestConfig:
+    def test_loads_empty_when_no_file(self, tmp_path):
+        cfg = voice.Config(str(tmp_path / "nonexistent.json"))
+        assert cfg.window_x is None
+        assert cfg.window_y is None
+        assert cfg.transcribe_ratio is None
 
-    def test_loads_saved_position(self, tmp_path):
-        config = tmp_path / "settings.json"
-        config.write_text(json.dumps({"window_x": 100, "window_y": 200}))
-        with patch("voice._config_path", return_value=str(config)):
-            assert voice._load_window_pos() == (100, 200)
+    def test_loads_window_position(self, tmp_path):
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"window_x": 100, "window_y": 200}))
+        cfg = voice.Config(str(path))
+        assert cfg.window_x == 100
+        assert cfg.window_y == 200
 
-    def test_returns_none_for_partial_data(self, tmp_path):
-        config = tmp_path / "settings.json"
-        config.write_text(json.dumps({"window_x": 100}))
-        with patch("voice._config_path", return_value=str(config)):
-            assert voice._load_window_pos() == (None, None)
+    def test_partial_window_position(self, tmp_path):
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"window_x": 100}))
+        cfg = voice.Config(str(path))
+        assert cfg.window_x == 100
+        assert cfg.window_y is None
 
-    def test_returns_none_for_invalid_json(self, tmp_path):
-        config = tmp_path / "settings.json"
-        config.write_text("not json")
-        with patch("voice._config_path", return_value=str(config)):
-            assert voice._load_window_pos() == (None, None)
+    def test_invalid_json_loads_empty(self, tmp_path):
+        path = tmp_path / "settings.json"
+        path.write_text("not json")
+        cfg = voice.Config(str(path))
+        assert cfg.window_x is None
 
     def test_converts_float_to_int(self, tmp_path):
-        config = tmp_path / "settings.json"
-        config.write_text(json.dumps({"window_x": 100.5, "window_y": 200.7}))
-        with patch("voice._config_path", return_value=str(config)):
-            assert voice._load_window_pos() == (100, 200)
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"window_x": 100.5, "window_y": 200.7}))
+        cfg = voice.Config(str(path))
+        assert cfg.window_x == 100
+        assert cfg.window_y == 200
 
     def test_rejects_string_values(self, tmp_path):
-        config = tmp_path / "settings.json"
-        config.write_text(json.dumps({"window_x": "abc", "window_y": 200}))
-        with patch("voice._config_path", return_value=str(config)):
-            assert voice._load_window_pos() == (None, None)
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"window_x": "abc"}))
+        cfg = voice.Config(str(path))
+        assert cfg.window_x is None
 
-
-class TestSaveWindowPos:
-    def test_creates_file_and_dirs(self, tmp_path):
-        config = tmp_path / "sub" / "dir" / "settings.json"
-        with patch("voice._config_path", return_value=str(config)):
-            voice._save_window_pos(150, 300)
-        data = json.loads(config.read_text())
+    def test_save_creates_dirs_and_file(self, tmp_path):
+        path = tmp_path / "sub" / "dir" / "settings.json"
+        cfg = voice.Config(str(path))
+        cfg.window_x = 150
+        cfg.window_y = 300
+        cfg.save()
+        data = json.loads(path.read_text())
         assert data["window_x"] == 150
         assert data["window_y"] == 300
 
-    def test_preserves_existing_keys(self, tmp_path):
-        config = tmp_path / "settings.json"
-        config.write_text(json.dumps({"other_key": "keep_me"}))
-        with patch("voice._config_path", return_value=str(config)):
-            voice._save_window_pos(10, 20)
-        data = json.loads(config.read_text())
+    def test_save_preserves_existing_keys(self, tmp_path):
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"other_key": "keep_me"}))
+        cfg = voice.Config(str(path))
+        cfg.window_x = 10
+        cfg.save()
+        data = json.loads(path.read_text())
         assert data["other_key"] == "keep_me"
         assert data["window_x"] == 10
-        assert data["window_y"] == 20
 
-    def test_overwrites_existing_position(self, tmp_path):
-        config = tmp_path / "settings.json"
-        config.write_text(json.dumps({"window_x": 1, "window_y": 2}))
-        with patch("voice._config_path", return_value=str(config)):
-            voice._save_window_pos(500, 600)
-        data = json.loads(config.read_text())
+    def test_save_overwrites_existing_position(self, tmp_path):
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"window_x": 1, "window_y": 2}))
+        cfg = voice.Config(str(path))
+        cfg.window_x = 500
+        cfg.window_y = 600
+        cfg.save()
+        data = json.loads(path.read_text())
         assert data["window_x"] == 500
         assert data["window_y"] == 600
 
     def test_handles_corrupt_existing_file(self, tmp_path):
-        config = tmp_path / "settings.json"
-        config.write_text("not json")
-        with patch("voice._config_path", return_value=str(config)):
-            voice._save_window_pos(10, 20)
-        data = json.loads(config.read_text())
+        path = tmp_path / "settings.json"
+        path.write_text("not json")
+        cfg = voice.Config(str(path))
+        cfg.window_x = 10
+        cfg.save()
+        data = json.loads(path.read_text())
         assert data["window_x"] == 10
-        assert data["window_y"] == 20
+
+    def test_transcribe_ratio_loads(self, tmp_path):
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"transcribe_ratio": 0.045}))
+        cfg = voice.Config(str(path))
+        assert cfg.transcribe_ratio == pytest.approx(0.045)
+
+    def test_transcribe_ratio_rejects_zero(self, tmp_path):
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"transcribe_ratio": 0}))
+        cfg = voice.Config(str(path))
+        assert cfg.transcribe_ratio is None
+
+    def test_transcribe_ratio_rejects_negative(self, tmp_path):
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"transcribe_ratio": -0.5}))
+        cfg = voice.Config(str(path))
+        assert cfg.transcribe_ratio is None
+
+    def test_transcribe_ratio_roundtrip(self, tmp_path):
+        path = tmp_path / "settings.json"
+        cfg = voice.Config(str(path))
+        cfg.transcribe_ratio = 0.0523
+        cfg.save()
+        cfg2 = voice.Config(str(path))
+        assert cfg2.transcribe_ratio == pytest.approx(0.0523)
+
+    def test_transcribe_ratio_preserves_other_keys(self, tmp_path):
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"window_x": 100}))
+        cfg = voice.Config(str(path))
+        cfg.transcribe_ratio = 0.03
+        cfg.save()
+        data = json.loads(path.read_text())
+        assert data["window_x"] == 100
+        assert data["transcribe_ratio"] == pytest.approx(0.03)
 
 
 class TestTruncatePath:
@@ -749,4 +790,7 @@ class TestMain:
         ):
             voice.main()
 
-        mock_record.assert_called_once_with(os.getcwd(), device_id=5)
+        mock_record.assert_called_once()
+        args, kwargs = mock_record.call_args
+        assert args[0] == os.getcwd()
+        assert kwargs["device_id"] == 5
