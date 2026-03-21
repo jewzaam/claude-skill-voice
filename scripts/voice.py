@@ -46,6 +46,7 @@ CONFIG_FILENAME = "settings.json"
 LOCK_FILENAME = "voice.lock"
 CONFIG_KEY_WINDOW_X = "window_x"
 CONFIG_KEY_WINDOW_Y = "window_y"
+CONFIG_KEY_TRANSCRIBE_RATIO = "transcribe_ratio"
 
 SAMPLE_RATE = 16000
 AUDIO_CHANNELS = 1
@@ -99,42 +100,58 @@ def _config_path() -> str:
     return os.path.join(base, APP_NAME, CONFIG_FILENAME)
 
 
-def _load_window_pos() -> tuple[int | None, int | None]:
-    """Load saved window position from config. Returns (x, y) or (None, None)."""
-    path = _config_path()
-    if not os.path.exists(path):
-        return None, None
-    try:
-        with open(path) as f:
-            data = json.load(f)
-        raw_x = data.get(CONFIG_KEY_WINDOW_X)
-        raw_y = data.get(CONFIG_KEY_WINDOW_Y)
-        x = int(raw_x) if isinstance(raw_x, (int, float)) else None
-        y = int(raw_y) if isinstance(raw_y, (int, float)) else None
-        if x is not None and y is not None:
-            return x, y
-    except (json.JSONDecodeError, OSError, ValueError):
-        pass
-    return None, None
+class Config:
+    """Persistent settings backed by a JSON file."""
 
+    def __init__(self, path: str | None = None):
+        self._path = path or _config_path()
+        self._data: dict = {}
+        self._load()
 
-def _save_window_pos(x: int, y: int) -> None:
-    """Save window position to config file with atomic write."""
-    path = _config_path()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    data: dict = {}
-    if os.path.exists(path):
+    def _load(self) -> None:
+        if not os.path.exists(self._path):
+            return
         try:
-            with open(path) as f:
-                data = json.load(f)
+            with open(self._path) as f:
+                self._data = json.load(f)
         except (json.JSONDecodeError, OSError):
-            pass
-    data[CONFIG_KEY_WINDOW_X] = x
-    data[CONFIG_KEY_WINDOW_Y] = y
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, path)
+            self._data = {}
+
+    def save(self) -> None:
+        os.makedirs(os.path.dirname(self._path), exist_ok=True)
+        tmp = self._path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self._data, f, indent=2)
+        os.replace(tmp, self._path)
+
+    @property
+    def window_x(self) -> int | None:
+        raw = self._data.get(CONFIG_KEY_WINDOW_X)
+        return int(raw) if isinstance(raw, (int, float)) else None
+
+    @window_x.setter
+    def window_x(self, value: int) -> None:
+        self._data[CONFIG_KEY_WINDOW_X] = value
+
+    @property
+    def window_y(self) -> int | None:
+        raw = self._data.get(CONFIG_KEY_WINDOW_Y)
+        return int(raw) if isinstance(raw, (int, float)) else None
+
+    @window_y.setter
+    def window_y(self, value: int) -> None:
+        self._data[CONFIG_KEY_WINDOW_Y] = value
+
+    @property
+    def transcribe_ratio(self) -> float | None:
+        raw = self._data.get(CONFIG_KEY_TRANSCRIBE_RATIO)
+        if isinstance(raw, (int, float)) and raw > 0:
+            return float(raw)
+        return None
+
+    @transcribe_ratio.setter
+    def transcribe_ratio(self, value: float) -> None:
+        self._data[CONFIG_KEY_TRANSCRIBE_RATIO] = round(value, 4)
 
 
 def _lock_path() -> str:
@@ -275,13 +292,17 @@ def _get_input_devices() -> list[dict]:
     return result
 
 
-def record_with_gui(cwd: str, *, device_id: int | None = None) -> np.ndarray:
+def record_with_gui(
+    cwd: str, *, device_id: int | None = None, config: Config | None = None
+) -> np.ndarray:
     """Show a tkinter popup while recording. Returns audio data.
 
     Raises:
         RecordingError: If no audio was captured.
         RecordingCancelled: If the user cancelled recording.
     """
+    if config is None:
+        config = Config()
     if device_id is None:
         device_id = _get_default_input_device()
         log.debug("resolved default input device: %d", device_id)
@@ -328,24 +349,42 @@ def record_with_gui(cwd: str, *, device_id: int | None = None) -> np.ndarray:
     root.attributes("-topmost", True)
     root.resizable(False, False)
 
-    saved_x, saved_y = _load_window_pos()
-    if saved_x is not None and saved_y is not None:
-        root.geometry(f"+{saved_x}+{saved_y}")
+    if config.window_x is not None and config.window_y is not None:
+        root.geometry(f"+{config.window_x}+{config.window_y}")
 
     frame = tk.Frame(root, padx=20, pady=15)
     frame.pack()
 
-    status_var = tk.StringVar(value="Recording...")
+    timer_frame = tk.Frame(frame)
+    timer_frame.pack(pady=(10, 5))
+    timer_frame.grid_columnconfigure(0, minsize=160)
+
+    status_var = tk.StringVar(value="Recording:")
     status_label = tk.Label(
-        frame,
+        timer_frame,
         textvariable=status_var,
         font=FONT_STATUS,
         fg=COLOR_RECORDING,
+        width=11,
+        anchor="w",
     )
-    status_label.pack()
+    status_label.grid(row=0, column=0, sticky="w", padx=(0, 5))
 
     elapsed_var = tk.StringVar(value="0:00")
-    tk.Label(frame, textvariable=elapsed_var, font=FONT_TIMER).pack(pady=(10, 5))
+    tk.Label(timer_frame, textvariable=elapsed_var, font=FONT_STATUS).grid(
+        row=0, column=1, sticky="e"
+    )
+
+    tk.Label(timer_frame, text="Transcribe:", font=FONT_STATUS, fg=COLOR_MUTED).grid(
+        row=1, column=0, sticky="w", padx=(0, 5)
+    )
+    transcribe_est_var = tk.StringVar(value="unknown")
+    tk.Label(
+        timer_frame,
+        textvariable=transcribe_est_var,
+        font=FONT_STATUS,
+        fg=COLOR_MUTED,
+    ).grid(row=1, column=1, sticky="e")
 
     display_cwd = _truncate_path(_home_relative_path(cwd))
     tk.Label(frame, text=display_cwd, font=FONT_DETAIL, fg=COLOR_MUTED).pack()
@@ -360,7 +399,9 @@ def record_with_gui(cwd: str, *, device_id: int | None = None) -> np.ndarray:
 
     def _save_pos_and_destroy():
         try:
-            _save_window_pos(root.winfo_x(), root.winfo_y())
+            config.window_x = root.winfo_x()
+            config.window_y = root.winfo_y()
+            config.save()
         except Exception:
             pass
         root.destroy()
@@ -376,14 +417,14 @@ def record_with_gui(cwd: str, *, device_id: int | None = None) -> np.ndarray:
         if paused:
             paused_elapsed += time.time() - pause_start
             paused = False
-            status_var.set("Recording...")
+            status_var.set("Recording:")
             status_label.config(fg=COLOR_RECORDING)
             pause_btn.config(text="Pause")
             update_timer()
         else:
             pause_start = time.time()
             paused = True
-            status_var.set("Paused")
+            status_var.set("Paused:")
             status_label.config(fg=COLOR_PAUSED)
             pause_btn.config(text="Resume")
 
@@ -391,6 +432,8 @@ def record_with_gui(cwd: str, *, device_id: int | None = None) -> np.ndarray:
         nonlocal recording
         recording = False
         _save_pos_and_destroy()
+
+    btn_width = 7
 
     cancel_btn = tk.Button(
         button_frame,
@@ -401,7 +444,7 @@ def record_with_gui(cwd: str, *, device_id: int | None = None) -> np.ndarray:
         fg="white",
         activebackground=COLOR_RECORDING_ACTIVE,
         activeforeground="white",
-        padx=15,
+        width=btn_width,
         pady=5,
     )
     cancel_btn.pack(side=tk.LEFT, padx=(0, 5))
@@ -415,7 +458,7 @@ def record_with_gui(cwd: str, *, device_id: int | None = None) -> np.ndarray:
         fg="white",
         activebackground=COLOR_PAUSED_ACTIVE,
         activeforeground="white",
-        padx=15,
+        width=btn_width,
         pady=5,
     )
     pause_btn.pack(side=tk.LEFT, padx=(0, 5))
@@ -429,7 +472,7 @@ def record_with_gui(cwd: str, *, device_id: int | None = None) -> np.ndarray:
         fg="white",
         activebackground=COLOR_DONE_ACTIVE,
         activeforeground="white",
-        padx=15,
+        width=btn_width,
         pady=5,
     )
     done_btn.pack(side=tk.LEFT)
@@ -438,11 +481,17 @@ def record_with_gui(cwd: str, *, device_id: int | None = None) -> np.ndarray:
     root.bind("<space>", lambda _e: toggle_pause())
     root.bind("<Return>", lambda _e: done_recording())
 
+    saved_ratio = config.transcribe_ratio
+
     def update_timer():
         if recording and not paused:
             elapsed = int(time.time() - start_time - paused_elapsed)
             mins, secs = divmod(elapsed, 60)
             elapsed_var.set(f"{mins}:{secs:02d}")
+            if saved_ratio is not None:
+                est = int(elapsed * saved_ratio)
+                est_mins, est_secs = divmod(est, 60)
+                transcribe_est_var.set(f"{est_mins}:{est_secs:02d}")
             root.after(TIMER_UPDATE_MS, update_timer)
 
     root.protocol("WM_DELETE_WINDOW", cancel_recording)
@@ -489,10 +538,16 @@ def save_wav(audio_data: np.ndarray) -> str:
 def transcribe(wav_path: str, *, model_size: str = DEFAULT_MODEL_SIZE) -> str:
     """Transcribe WAV file using faster-whisper."""
     log.info("Transcribing with model '%s'...", model_size)
+    # Suppress stdout from ctranslate2/faster-whisper progress output
+    devnull = open(os.devnull, "w")  # noqa: SIM115
+    saved_stdout = sys.stdout
+    sys.stdout = devnull
     try:
         model = WhisperModel(
             model_size, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE
         )
+        segments, _ = model.transcribe(wav_path, beam_size=WHISPER_BEAM_SIZE)
+        text_parts = [seg.text.strip() for seg in segments]
     except Exception as e:
         log.error(
             "Failed to load Whisper model '%s': %s\n"
@@ -502,8 +557,9 @@ def transcribe(wav_path: str, *, model_size: str = DEFAULT_MODEL_SIZE) -> str:
             e,
         )
         raise
-    segments, _ = model.transcribe(wav_path, beam_size=WHISPER_BEAM_SIZE)
-    text_parts = [seg.text.strip() for seg in segments]
+    finally:
+        sys.stdout = saved_stdout
+        devnull.close()
     return " ".join(text_parts).strip()
 
 
@@ -555,19 +611,37 @@ def main() -> None:
         sys.exit(EXIT_ERROR)
 
     try:
+        cfg = Config()
         cwd = os.getcwd()
         try:
-            audio_data = record_with_gui(cwd, device_id=args.device)
+            audio_data = record_with_gui(cwd, device_id=args.device, config=cfg)
         except RecordingCancelled:
             sys.exit(EXIT_ERROR)
         except RecordingError as e:
             log.error("%s", e)
             sys.exit(EXIT_ERROR)
 
+        audio_duration = len(audio_data) / SAMPLE_RATE
+        if cfg.transcribe_ratio is not None:
+            est = audio_duration * cfg.transcribe_ratio
+            log.info("Estimated transcription time: %.0fs", est)
+
         wav_path = None
         try:
             wav_path = save_wav(audio_data)
+            t_start = time.time()
             transcript = transcribe(wav_path, model_size=args.model)
+            t_elapsed = time.time() - t_start
+            if audio_duration > 0:
+                new_ratio = t_elapsed / audio_duration
+                cfg.transcribe_ratio = new_ratio
+                cfg.save()
+                log.debug(
+                    "transcription took %.1fs for %.1fs audio (ratio=%.4f)",
+                    t_elapsed,
+                    audio_duration,
+                    new_ratio,
+                )
         finally:
             if wav_path and os.path.exists(wav_path):
                 os.remove(wav_path)
