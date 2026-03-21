@@ -71,7 +71,7 @@ The first run downloads the selected model automatically (requires internet).
 To see available input devices, run the script directly:
 
 ```bash
-python3 ~/.claude/skills/voice/scripts/voice.py --list-devices
+~/.claude/skills/voice/.venv/bin/python ~/.claude/skills/voice/scripts/voice.py --list-devices
 ```
 
 ## How it works
