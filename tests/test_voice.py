@@ -307,6 +307,99 @@ class TestRecordingError:
         assert str(err) == "test"
 
 
+class TestLockAcquireError:
+    def test_is_exception(self):
+        err = voice.LockAcquireError("lock failed")
+        assert isinstance(err, Exception)
+        assert str(err) == "lock failed"
+
+
+class TestIsPidAlive:
+    def test_own_pid_is_alive(self):
+        assert voice._is_pid_alive(os.getpid()) is True
+
+    def test_dead_pid_is_not_alive(self):
+        assert voice._is_pid_alive(999999999) is False
+
+    def test_permission_denied_means_alive(self):
+        # PID 1 exists but we can't signal it as non-root
+        assert voice._is_pid_alive(1) is True
+
+
+class TestWriteLockFile:
+    def test_creates_file_with_pid(self, tmp_path):
+        lock = str(tmp_path / "voice.lock")
+        voice._write_lock_file(lock, os.getpid())
+        with open(lock) as f:
+            assert int(f.read().strip()) == os.getpid()
+
+    def test_raises_if_file_exists(self, tmp_path):
+        lock = str(tmp_path / "voice.lock")
+        voice._write_lock_file(lock, os.getpid())
+        with pytest.raises(FileExistsError):
+            voice._write_lock_file(lock, os.getpid())
+
+
+class TestAcquireReleaseLock:
+    def test_acquires_lock_on_empty_directory(self, tmp_path):
+        lock = tmp_path / "voice.lock"
+        with patch("voice._lock_path", return_value=str(lock)):
+            voice._acquire_lock()
+        assert lock.exists()
+        assert lock.read_text().strip() == str(os.getpid())
+
+    def test_release_removes_own_lock(self, tmp_path):
+        lock = tmp_path / "voice.lock"
+        with patch("voice._lock_path", return_value=str(lock)):
+            voice._acquire_lock()
+            voice._release_lock()
+        assert not lock.exists()
+
+    def test_own_pid_reacquires_silently(self, tmp_path):
+        lock = tmp_path / "voice.lock"
+        lock.write_text(str(os.getpid()))
+        with patch("voice._lock_path", return_value=str(lock)):
+            voice._acquire_lock()
+        assert lock.read_text().strip() == str(os.getpid())
+
+    def test_raises_when_held_by_another_live_process(self, tmp_path):
+        lock = tmp_path / "voice.lock"
+        lock.write_text("1")  # PID 1 is always alive
+        with patch("voice._lock_path", return_value=str(lock)):
+            with pytest.raises(voice.LockAcquireError):
+                voice._acquire_lock()
+
+    def test_clears_stale_lock_from_dead_process(self, tmp_path):
+        lock = tmp_path / "voice.lock"
+        lock.write_text("999999999")  # dead PID
+        with patch("voice._lock_path", return_value=str(lock)):
+            voice._acquire_lock()
+        assert lock.read_text().strip() == str(os.getpid())
+
+    def test_release_does_not_remove_lock_owned_by_other(self, tmp_path):
+        lock = tmp_path / "voice.lock"
+        lock.write_text("1")
+        with patch("voice._lock_path", return_value=str(lock)):
+            voice._release_lock()
+        assert lock.exists()
+        assert lock.read_text().strip() == "1"
+
+    def test_release_tolerates_missing_lockfile(self, tmp_path):
+        lock = tmp_path / "nonexistent.lock"
+        with patch("voice._lock_path", return_value=str(lock)):
+            voice._release_lock()
+
+    def test_release_logs_warning_when_not_owner(self, tmp_path):
+        lock = tmp_path / "voice.lock"
+        lock.write_text("1")
+        with (
+            patch("voice._lock_path", return_value=str(lock)),
+            patch("voice.log") as mock_log,
+        ):
+            voice._release_lock()
+        mock_log.warning.assert_called_once()
+
+
 class TestRecordingCancelled:
     def test_is_exception(self):
         err = voice.RecordingCancelled("cancelled")
@@ -368,7 +461,7 @@ class TestRecordWithGui:
         ):
             with pytest.raises(SystemExit) as exc_info:
                 voice.record_with_gui("/tmp", device_id=0)
-            assert exc_info.value.code == 1
+            assert exc_info.value.code == voice.EXIT_ERROR
 
     def test_stream_cleanup_on_exception(self):
         mock_stream = MagicMock()
@@ -494,19 +587,31 @@ class TestRecordWithGui:
 
 
 class TestTranscribeErrorHandling:
-    def test_model_load_prints_helpful_message(self, capsys):
-        with patch(
-            "voice.WhisperModel",
-            side_effect=RuntimeError("connection refused"),
+    def test_model_load_logs_helpful_message(self):
+        with (
+            patch(
+                "voice.WhisperModel",
+                side_effect=RuntimeError("connection refused"),
+            ),
+            patch("voice.log") as mock_log,
         ):
             with pytest.raises(RuntimeError):
                 voice.transcribe("/tmp/test.wav", model_size="small")
 
-        captured = capsys.readouterr()
-        assert "Failed to load Whisper model 'small'" in captured.err
-        assert "faster-whisper" in captured.err
+        mock_log.error.assert_called_once()
+        msg = mock_log.error.call_args[0][0] % mock_log.error.call_args[0][1:]
+        assert "Failed to load Whisper model 'small'" in msg
+        assert "faster-whisper" in msg
 
 
+@pytest.fixture(autouse=False)
+def _no_lock():
+    """Disable lockfile in tests that call main()."""
+    with patch("voice._acquire_lock"), patch("voice._release_lock"):
+        yield
+
+
+@pytest.mark.usefixtures("_no_lock")
 class TestMain:
     def test_empty_transcript_exits_nonzero(self):
         mock_audio = np.zeros(16000, dtype=np.int16)
@@ -521,7 +626,7 @@ class TestMain:
         ):
             with pytest.raises(SystemExit) as exc_info:
                 voice.main()
-            assert exc_info.value.code == 1
+            assert exc_info.value.code == voice.EXIT_ERROR
 
     def test_recording_error_exits_nonzero(self):
         with (
@@ -533,7 +638,7 @@ class TestMain:
         ):
             with pytest.raises(SystemExit) as exc_info:
                 voice.main()
-            assert exc_info.value.code == 1
+            assert exc_info.value.code == voice.EXIT_ERROR
 
     def test_recording_cancelled_exits_nonzero(self):
         with (
@@ -545,7 +650,7 @@ class TestMain:
         ):
             with pytest.raises(SystemExit) as exc_info:
                 voice.main()
-            assert exc_info.value.code == 1
+            assert exc_info.value.code == voice.EXIT_ERROR
 
     def test_successful_transcript_prints_to_stdout(self, capsys):
         mock_audio = np.zeros(16000, dtype=np.int16)
@@ -605,7 +710,7 @@ class TestMain:
         ):
             with pytest.raises(SystemExit) as exc_info:
                 voice.main()
-            assert exc_info.value.code == 0
+            assert exc_info.value.code == voice.EXIT_SUCCESS
 
     def test_list_devices_no_devices_exits_nonzero(self):
         with (
@@ -614,7 +719,7 @@ class TestMain:
         ):
             with pytest.raises(SystemExit) as exc_info:
                 voice.main()
-            assert exc_info.value.code == 1
+            assert exc_info.value.code == voice.EXIT_ERROR
 
     def test_model_flag_passed_to_transcribe(self):
         mock_audio = np.zeros(16000, dtype=np.int16)

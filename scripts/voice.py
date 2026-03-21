@@ -43,6 +43,7 @@ log = logging.getLogger(__name__)
 
 APP_NAME = "claude-skill-voice"
 CONFIG_FILENAME = "settings.json"
+LOCK_FILENAME = "voice.lock"
 CONFIG_KEY_WINDOW_X = "window_x"
 CONFIG_KEY_WINDOW_Y = "window_y"
 
@@ -54,6 +55,9 @@ DEFAULT_MODEL_SIZE = "base"
 WHISPER_BEAM_SIZE = 5
 WHISPER_DEVICE = "cpu"
 WHISPER_COMPUTE_TYPE = "int8"
+
+EXIT_SUCCESS = 0
+EXIT_ERROR = 1
 
 MAX_PATH_DISPLAY_LENGTH = 60
 TIMER_UPDATE_MS = 200
@@ -70,6 +74,18 @@ FONT_STATUS = ("sans-serif", 16, "bold")
 FONT_TIMER = ("monospace", 24)
 FONT_DETAIL = ("monospace", 9)
 FONT_BUTTON = ("sans-serif", 12)
+
+
+class RecordingError(Exception):
+    """Raised when audio recording fails."""
+
+
+class RecordingCancelled(Exception):
+    """Raised when the user cancels recording."""
+
+
+class LockAcquireError(Exception):
+    """Raised when the lock file cannot be acquired."""
 
 
 def _config_path() -> str:
@@ -121,12 +137,107 @@ def _save_window_pos(x: int, y: int) -> None:
     os.replace(tmp, path)
 
 
-class RecordingError(Exception):
-    """Raised when audio recording fails."""
+def _lock_path() -> str:
+    """Return path to the PID lockfile."""
+    config_dir = os.path.dirname(_config_path())
+    return os.path.join(config_dir, LOCK_FILENAME)
 
 
-class RecordingCancelled(Exception):
-    """Raised when the user cancels recording."""
+def _is_pid_alive(pid: int) -> bool:
+    """Check if a process with the given PID is running."""
+    try:
+        os.kill(pid, 0)  # signal 0: check existence, does not kill
+        return True
+    except PermissionError:
+        return True  # exists but we lack permission to signal it
+    except OSError:
+        return False
+
+
+def _read_lock_pid() -> int | None:
+    """Read and return the PID from the lockfile, or None if unreadable."""
+    path = _lock_path()
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            return int(f.read().strip())
+    except (ValueError, OSError):
+        return None
+
+
+def _write_lock_file(path: str, pid: int) -> None:
+    """Atomically create lockfile with PID. Raises FileExistsError if exists."""
+    fd = None
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(pid).encode())
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _acquire_lock() -> None:
+    """Acquire the PID lockfile. Raises LockAcquireError if held by another.
+
+    Uses O_CREAT|O_EXCL for atomic file creation to prevent race conditions.
+    """
+    path = _lock_path()
+    my_pid = os.getpid()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    # Fast path: try atomic create
+    try:
+        _write_lock_file(path, my_pid)
+        log.debug("lock acquired: pid=%d", my_pid)
+        return
+    except FileExistsError:
+        pass
+
+    # Lock file exists — check who owns it
+    lock_pid = _read_lock_pid()
+
+    if lock_pid is not None and lock_pid == my_pid:
+        log.debug("lock already owned by us: pid=%d", my_pid)
+        return
+
+    if lock_pid is not None and _is_pid_alive(lock_pid):
+        log.debug("lock held by live process: pid=%d", lock_pid)
+        raise LockAcquireError(
+            "Another voice recording session is already running. "
+            "Finish that session before starting a new one."
+        )
+
+    # Stale lock (process dead or bad PID) — remove and retry
+    log.debug("removing stale lock: pid=%s", lock_pid)
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    try:
+        _write_lock_file(path, my_pid)
+        log.debug("lock acquired after stale cleanup: pid=%d", my_pid)
+    except FileExistsError:
+        raise LockAcquireError(
+            "Failed to acquire lock. Another session may have started."
+        )
+
+
+def _release_lock() -> None:
+    """Remove the PID lockfile only if we own it."""
+    lock_pid = _read_lock_pid()
+    if lock_pid is not None and lock_pid != os.getpid():
+        log.warning(
+            "lock not owned by us (owner=%d, self=%d), not releasing",
+            lock_pid,
+            os.getpid(),
+        )
+        return
+    try:
+        os.remove(_lock_path())
+        log.debug("lock released")
+    except OSError:
+        pass
 
 
 def _home_relative_path(path: str) -> str:
@@ -209,8 +320,8 @@ def record_with_gui(cwd: str, *, device_id: int | None = None) -> np.ndarray:
             device=device_id,
         )
     except Exception as e:
-        print(f"Failed to access microphone: {e}", file=sys.stderr)
-        sys.exit(1)
+        log.error("Failed to access microphone: %s", e)
+        sys.exit(EXIT_ERROR)
 
     root = tk.Tk()
     root.title("Claude Voice")
@@ -359,7 +470,7 @@ def record_with_gui(cwd: str, *, device_id: int | None = None) -> np.ndarray:
 
     audio_data = np.concatenate(chunks, axis=0)
     duration = len(audio_data) / SAMPLE_RATE
-    print(f"Captured {duration:.1f}s of audio.", file=sys.stderr)
+    log.info("Captured %.1fs of audio.", duration)
     return audio_data
 
 
@@ -377,17 +488,18 @@ def save_wav(audio_data: np.ndarray) -> str:
 
 def transcribe(wav_path: str, *, model_size: str = DEFAULT_MODEL_SIZE) -> str:
     """Transcribe WAV file using faster-whisper."""
-    print(f"Transcribing with model '{model_size}'...", file=sys.stderr)
+    log.info("Transcribing with model '%s'...", model_size)
     try:
         model = WhisperModel(
             model_size, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE
         )
     except Exception as e:
-        print(
-            f"Failed to load Whisper model '{model_size}': {e}\n"
+        log.error(
+            "Failed to load Whisper model '%s': %s\n"
             "Ensure faster-whisper is installed and you have internet "
             "connectivity for initial model download.",
-            file=sys.stderr,
+            model_size,
+            e,
         )
         raise
     segments, _ = model.transcribe(wav_path, beam_size=WHISPER_BEAM_SIZE)
@@ -422,44 +534,52 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.debug:
-        handler = logging.StreamHandler(sys.stderr)
-        handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
-        log.addHandler(handler)
-        log.setLevel(logging.DEBUG)
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    log.addHandler(handler)
+    log.setLevel(logging.DEBUG if args.debug else logging.INFO)
 
     if args.list_devices:
         devices = _get_input_devices()
         if not devices:
-            print("No input devices found.", file=sys.stderr)
-            sys.exit(1)
+            log.error("No input devices found.")
+            sys.exit(EXIT_ERROR)
         for dev in devices:
-            print(f"  {dev['id']}: {dev['name']}", file=sys.stderr)
-        sys.exit(0)
+            log.info("  %d: %s", dev["id"], dev["name"])
+        sys.exit(EXIT_SUCCESS)
 
-    cwd = os.getcwd()
     try:
-        audio_data = record_with_gui(cwd, device_id=args.device)
-    except RecordingCancelled:
-        sys.exit(1)
-    except RecordingError as e:
-        print(str(e), file=sys.stderr)
-        sys.exit(1)
+        _acquire_lock()
+    except LockAcquireError as e:
+        log.error("%s", e)
+        sys.exit(EXIT_ERROR)
 
-    wav_path = None
     try:
-        wav_path = save_wav(audio_data)
-        transcript = transcribe(wav_path, model_size=args.model)
+        cwd = os.getcwd()
+        try:
+            audio_data = record_with_gui(cwd, device_id=args.device)
+        except RecordingCancelled:
+            sys.exit(EXIT_ERROR)
+        except RecordingError as e:
+            log.error("%s", e)
+            sys.exit(EXIT_ERROR)
+
+        wav_path = None
+        try:
+            wav_path = save_wav(audio_data)
+            transcript = transcribe(wav_path, model_size=args.model)
+        finally:
+            if wav_path and os.path.exists(wav_path):
+                os.remove(wav_path)
+
+        if not transcript:
+            log.warning("No speech detected in audio.")
+            sys.exit(EXIT_ERROR)
+
+        # stdout = transcript (what Claude Code reads)
+        print(transcript)
     finally:
-        if wav_path and os.path.exists(wav_path):
-            os.remove(wav_path)
-
-    if not transcript:
-        print("No speech detected in audio.", file=sys.stderr)
-        sys.exit(1)
-
-    # stdout = transcript (what Claude Code reads)
-    print(transcript)
+        _release_lock()
 
 
 if __name__ == "__main__":
