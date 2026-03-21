@@ -28,7 +28,7 @@ cd ~/.claude/skills/voice
 make install
 ```
 
-This creates a local `.venv` virtual environment and installs `faster-whisper`, `sounddevice`, and `numpy`.
+This creates a virtual environment at `~/.claude/venvs/voice` and installs dependencies.
 
 To verify everything works:
 
@@ -71,7 +71,7 @@ The first run downloads the selected model automatically (requires internet).
 To see available input devices, run the script directly:
 
 ```bash
-~/.claude/skills/voice/.venv/bin/python ~/.claude/skills/voice/scripts/voice.py --list-devices
+~/.claude/venvs/voice/bin/python ~/.claude/skills/voice/scripts/voice.py --list-devices
 ```
 
 ## How it works
