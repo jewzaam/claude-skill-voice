@@ -11,8 +11,9 @@ Record audio from the user's microphone, transcribe it locally, and treat the tr
 
 1. **Run the voice script** via Bash with `run_in_background: true` (recording has no time limit — the user controls when to stop via the GUI):
    ```
-   python3 <skill_base_dir>/scripts/voice.py 2>/dev/null
+   <skill_base_dir>/.venv/bin/python <skill_base_dir>/scripts/voice.py 2>/dev/null
    ```
+   - On Windows, use `.venv/Scripts/python.exe` instead of `.venv/bin/python`.
    - Use `run_in_background: true` on the Bash tool call. This avoids the 2-minute default timeout killing long recordings. You will be notified when the recording finishes.
    - `2>/dev/null` suppresses stderr because the Bash tool merges stderr into stdout, which would mix progress messages ("Captured 9.6s...", "Transcribing...") into the transcript.
    - Replace `<skill_base_dir>` with the directory containing this SKILL.md file.
@@ -25,7 +26,7 @@ Record audio from the user's microphone, transcribe it locally, and treat the tr
 
 3. **Handle edge cases**:
    - If the script exits with a non-zero status and stderr contains "already running", tell the user: "A voice recording session is already in progress. Please finish that session before starting a new one."
-   - If the script exits with a non-zero status for other reasons, inform the user that voice capture failed and suggest they check microphone permissions or dependencies (`sounddevice`, `faster-whisper`, `numpy`).
+   - If the script exits with a non-zero status for other reasons (e.g., `ModuleNotFoundError`, missing Python executable, or import errors), tell the user: "Voice capture failed. Make sure you've run `make install` in your skills/voice directory (e.g., `cd ~/.claude/skills/voice && make install`) to create the virtual environment and install dependencies." Also suggest checking microphone permissions if the error is not dependency-related.
    - If stdout is empty or whitespace-only, tell the user no speech was detected and ask them to try again.
 
 4. **Respond to the transcript** -- treat the captured text as if the user had typed it directly. Do not quote or parrot it back; just act on it naturally.
