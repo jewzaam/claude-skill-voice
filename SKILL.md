@@ -9,10 +9,11 @@ Record audio from the user's microphone, transcribe it locally, and treat the tr
 
 ## Steps
 
-1. **Run the voice script** via Bash:
+1. **Run the voice script** via Bash with `run_in_background: true` (recording has no time limit — the user controls when to stop via the GUI):
    ```
    python3 <skill_base_dir>/scripts/voice.py 2>/dev/null
    ```
+   - Use `run_in_background: true` on the Bash tool call. This avoids the 2-minute default timeout killing long recordings. You will be notified when the recording finishes.
    - `2>/dev/null` suppresses stderr because the Bash tool merges stderr into stdout, which would mix progress messages ("Captured 9.6s...", "Transcribing...") into the transcript.
    - Replace `<skill_base_dir>` with the directory containing this SKILL.md file.
    - Optional flags:
@@ -20,10 +21,11 @@ Record audio from the user's microphone, transcribe it locally, and treat the tr
      - `--device DEVICE_ID` to select a specific audio input device.
      - `--list-devices` to show available input devices and exit.
 
-2. **Capture stdout** -- that is the transcript. Ignore stderr (it contains progress/status messages).
+2. **Wait for completion** -- after launching in the background, tell the user that recording has started and they should press Done (or Enter) when finished. You will be automatically notified when the background task completes. Then read the output file to get the transcript.
 
 3. **Handle edge cases**:
-   - If the script exits with a non-zero status, inform the user that voice capture failed and suggest they check microphone permissions or dependencies (`sounddevice`, `faster-whisper`, `numpy`).
+   - If the script exits with a non-zero status and stderr contains "already running", tell the user: "A voice recording session is already in progress. Please finish that session before starting a new one."
+   - If the script exits with a non-zero status for other reasons, inform the user that voice capture failed and suggest they check microphone permissions or dependencies (`sounddevice`, `faster-whisper`, `numpy`).
    - If stdout is empty or whitespace-only, tell the user no speech was detected and ask them to try again.
 
 4. **Respond to the transcript** -- treat the captured text as if the user had typed it directly. Do not quote or parrot it back; just act on it naturally.
