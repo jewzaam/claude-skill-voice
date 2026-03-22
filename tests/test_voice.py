@@ -20,8 +20,8 @@ import voice  # noqa: E402
 class TestHomeRelativePath:
     def test_converts_home_path(self):
         home = os.path.expanduser("~")
-        result = voice._home_relative_path(home + "/projects/foo")
-        assert result == "~/projects/foo"
+        result = voice._home_relative_path(os.path.join(home, "projects", "foo"))
+        assert result == "~" + os.sep + "projects" + os.sep + "foo"
 
     def test_home_itself(self):
         home = os.path.expanduser("~")
@@ -38,7 +38,8 @@ class TestConfigPath:
             patch.dict(os.environ, {"XDG_CONFIG_HOME": "/custom/config"}, clear=False),
         ):
             result = voice._config_path()
-        assert result == "/custom/config/claude-skill-voice/settings.json"
+        expected = os.path.join("/custom/config", "claude-skill-voice", "settings.json")
+        assert result == expected
 
     def test_linux_defaults_to_dot_config(self):
         with (
@@ -50,7 +51,8 @@ class TestConfigPath:
             env.pop("XDG_CONFIG_HOME", None)
             with patch.dict(os.environ, env, clear=True):
                 result = voice._config_path()
-        assert "claude-skill-voice/settings.json" in result
+        assert "claude-skill-voice" in result
+        assert "settings.json" in result
 
     def test_windows_uses_appdata(self):
         with (
@@ -362,9 +364,10 @@ class TestIsPidAlive:
     def test_dead_pid_is_not_alive(self):
         assert voice._is_pid_alive(999999999) is False
 
-    def test_permission_denied_means_alive(self):
-        # PID 1 exists but we can't signal it as non-root
-        assert voice._is_pid_alive(1) is True
+    def test_another_live_process_is_alive(self):
+        # Use parent PID — guaranteed to be alive and not us
+        ppid = os.getppid()
+        assert voice._is_pid_alive(ppid) is True
 
 
 class TestWriteLockFile:
@@ -405,7 +408,8 @@ class TestAcquireReleaseLock:
 
     def test_raises_when_held_by_another_live_process(self, tmp_path):
         lock = tmp_path / "voice.lock"
-        lock.write_text("1")  # PID 1 is always alive
+        ppid = os.getppid()  # guaranteed alive, not us
+        lock.write_text(str(ppid))
         with patch("voice._lock_path", return_value=str(lock)):
             with pytest.raises(voice.LockAcquireError):
                 voice._acquire_lock()
@@ -419,11 +423,12 @@ class TestAcquireReleaseLock:
 
     def test_release_does_not_remove_lock_owned_by_other(self, tmp_path):
         lock = tmp_path / "voice.lock"
-        lock.write_text("1")
+        ppid = str(os.getppid())
+        lock.write_text(ppid)
         with patch("voice._lock_path", return_value=str(lock)):
             voice._release_lock()
         assert lock.exists()
-        assert lock.read_text().strip() == "1"
+        assert lock.read_text().strip() == ppid
 
     def test_release_tolerates_missing_lockfile(self, tmp_path):
         lock = tmp_path / "nonexistent.lock"
@@ -432,7 +437,7 @@ class TestAcquireReleaseLock:
 
     def test_release_logs_warning_when_not_owner(self, tmp_path):
         lock = tmp_path / "voice.lock"
-        lock.write_text("1")
+        lock.write_text(str(os.getppid()))
         with (
             patch("voice._lock_path", return_value=str(lock)),
             patch("voice.log") as mock_log,
@@ -654,7 +659,7 @@ def _no_lock():
 
 @pytest.mark.usefixtures("_no_lock")
 class TestMain:
-    def test_empty_transcript_exits_nonzero(self):
+    def test_empty_transcript_prints_done_only(self, capsys):
         mock_audio = np.zeros(16000, dtype=np.int16)
 
         with (
@@ -667,7 +672,10 @@ class TestMain:
         ):
             with pytest.raises(SystemExit) as exc_info:
                 voice.main()
-            assert exc_info.value.code == voice.EXIT_ERROR
+            assert exc_info.value.code == voice.EXIT_SUCCESS
+
+        captured = capsys.readouterr()
+        assert captured.out.strip() == "[DONE]"
 
     def test_recording_error_exits_nonzero(self):
         with (
@@ -681,7 +689,7 @@ class TestMain:
                 voice.main()
             assert exc_info.value.code == voice.EXIT_ERROR
 
-    def test_recording_cancelled_exits_nonzero(self):
+    def test_recording_cancelled_prints_cancel(self, capsys):
         with (
             patch("sys.argv", ["voice.py"]),
             patch(
@@ -691,7 +699,10 @@ class TestMain:
         ):
             with pytest.raises(SystemExit) as exc_info:
                 voice.main()
-            assert exc_info.value.code == voice.EXIT_ERROR
+            assert exc_info.value.code == voice.EXIT_SUCCESS
+
+        captured = capsys.readouterr()
+        assert captured.out.strip() == "[CANCEL]"
 
     def test_successful_transcript_prints_to_stdout(self, capsys):
         mock_audio = np.zeros(16000, dtype=np.int16)
@@ -707,7 +718,9 @@ class TestMain:
             voice.main()
 
         captured = capsys.readouterr()
-        assert captured.out.strip() == "hello world"
+        lines = captured.out.strip().split("\n")
+        assert lines[0] == "[DONE]"
+        assert lines[1] == "hello world"
 
     def test_wav_cleanup_on_transcription_failure(self):
         mock_audio = np.zeros(16000, dtype=np.int16)

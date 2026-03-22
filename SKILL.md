@@ -24,9 +24,12 @@ Record audio from the user's microphone, transcribe it locally, and treat the tr
 
 2. **Wait for completion** -- after launching in the background, tell the user that recording has started and they should press Done (or Enter) when finished. You will be automatically notified when the background task completes. Then read the output file to get the transcript.
 
-3. **Handle edge cases**:
-   - If the script exits with a non-zero status and stderr contains "already running", tell the user: "A voice recording session is already in progress. Please finish that session before starting a new one."
-   - If the script exits with a non-zero status for other reasons (e.g., `ModuleNotFoundError`, missing Python executable, or import errors), tell the user: "Voice capture failed. Make sure you've run `make install` in your skills/voice directory (e.g., `cd ~/.claude/skills/voice && make install`) to create the virtual environment and install dependencies." Also suggest checking microphone permissions if the error is not dependency-related.
-   - If stdout is empty or whitespace-only, tell the user no speech was detected and ask them to try again.
+3. **Parse the output** -- the first line of stdout is always a status indicator. Use it to determine what happened:
+   - `[CANCEL]` — the user pressed Cancel or Escape. No transcript follows. **Do nothing** — do not ask them to try again, do not comment on it. Just stop.
+   - `[DONE]` — the user pressed Done. If there is text on subsequent lines, that is the transcript. If there is no text after `[DONE]`, no speech was detected — tell the user and ask them to try again.
 
-4. **Respond to the transcript** -- treat the captured text as if the user had typed it directly. Do not quote or parrot it back; just act on it naturally.
+4. **Handle errors** (non-zero exit, no status line):
+   - If stderr contains "already running", tell the user: "A voice recording session is already in progress. Please finish that session before starting a new one."
+   - For other failures (e.g., `ModuleNotFoundError`, missing Python executable, or import errors), tell the user: "Voice capture failed. Make sure you've run `make install` in your skills/voice directory (e.g., `cd ~/.claude/skills/voice && make install`) to create the virtual environment and install dependencies." Also suggest checking microphone permissions if the error is not dependency-related.
+
+5. **Respond to the transcript** -- treat the captured text as if the user had typed it directly. Do not quote or parrot it back; just act on it naturally.
