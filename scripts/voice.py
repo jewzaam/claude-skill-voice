@@ -616,7 +616,8 @@ def main() -> None:
         try:
             audio_data = record_with_gui(cwd, device_id=args.device, config=cfg)
         except RecordingCancelled:
-            sys.exit(EXIT_ERROR)
+            print("[CANCEL]")
+            sys.exit(EXIT_SUCCESS)
         except RecordingError as e:
             log.error("%s", e)
             sys.exit(EXIT_ERROR)
@@ -647,10 +648,12 @@ def main() -> None:
                 os.remove(wav_path)
 
         if not transcript:
+            print("[DONE]")
             log.warning("No speech detected in audio.")
-            sys.exit(EXIT_ERROR)
+            sys.exit(EXIT_SUCCESS)
 
-        # stdout = transcript (what Claude Code reads)
+        # stdout: status line then transcript (what Claude Code reads)
+        print("[DONE]")
         print(transcript)
     finally:
         _release_lock()
