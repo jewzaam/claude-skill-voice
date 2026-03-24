@@ -300,7 +300,7 @@ class TestTranscribe:
         mock_model = MagicMock()
         mock_model.transcribe.return_value = ([mock_segment1, mock_segment2], None)
 
-        with patch("voice.WhisperModel", return_value=mock_model) as mock_cls:
+        with patch("faster_whisper.WhisperModel", return_value=mock_model) as mock_cls:
             result = voice.transcribe("/tmp/test.wav", model_size="tiny")
 
         mock_cls.assert_called_once_with("tiny", device="cpu", compute_type="int8")
@@ -311,7 +311,7 @@ class TestTranscribe:
         mock_model = MagicMock()
         mock_model.transcribe.return_value = ([], None)
 
-        with patch("voice.WhisperModel", return_value=mock_model):
+        with patch("faster_whisper.WhisperModel", return_value=mock_model):
             result = voice.transcribe("/tmp/test.wav")
 
         assert result == ""
@@ -323,13 +323,15 @@ class TestTranscribe:
         mock_model = MagicMock()
         mock_model.transcribe.return_value = ([mock_segment], None)
 
-        with patch("voice.WhisperModel", return_value=mock_model):
+        with patch("faster_whisper.WhisperModel", return_value=mock_model):
             result = voice.transcribe("/tmp/test.wav")
 
         assert result == ""
 
     def test_model_load_failure(self):
-        with patch("voice.WhisperModel", side_effect=RuntimeError("download failed")):
+        with patch(
+            "faster_whisper.WhisperModel", side_effect=RuntimeError("download failed")
+        ):
             with pytest.raises(RuntimeError, match="download failed"):
                 voice.transcribe("/tmp/test.wav")
 
@@ -337,7 +339,7 @@ class TestTranscribe:
         mock_model = MagicMock()
         mock_model.transcribe.return_value = ([], None)
 
-        with patch("voice.WhisperModel", return_value=mock_model) as mock_cls:
+        with patch("faster_whisper.WhisperModel", return_value=mock_model) as mock_cls:
             voice.transcribe("/tmp/test.wav")
 
         mock_cls.assert_called_once_with("base", device="cpu", compute_type="int8")
@@ -636,7 +638,7 @@ class TestTranscribeErrorHandling:
     def test_model_load_logs_helpful_message(self):
         with (
             patch(
-                "voice.WhisperModel",
+                "faster_whisper.WhisperModel",
                 side_effect=RuntimeError("connection refused"),
             ),
             patch("voice.log") as mock_log,

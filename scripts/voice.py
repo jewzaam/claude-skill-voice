@@ -35,11 +35,42 @@ except ModuleNotFoundError:
     )
     sys.exit(1)
 
+import threading
+
 import numpy as np
 import sounddevice as sd
-from faster_whisper import WhisperModel
 
 log = logging.getLogger(__name__)
+
+# Background import of faster-whisper (heavy C++ bindings).
+# Started early so the import finishes during recording.
+_whisper_preload_started = False
+_whisper_module_ready = threading.Event()
+_WhisperModel = None
+
+
+def _preload_whisper() -> None:
+    """Import faster-whisper in a background thread."""
+    global _WhisperModel
+    try:
+        from faster_whisper import WhisperModel
+
+        _WhisperModel = WhisperModel
+    except Exception:
+        pass  # transcribe() will re-attempt and surface the error
+    finally:
+        _whisper_module_ready.set()
+
+
+def start_whisper_preload() -> None:
+    """Kick off the background import. Safe to call multiple times."""
+    global _whisper_preload_started
+    if _whisper_preload_started:
+        return
+    _whisper_preload_started = True
+    t = threading.Thread(target=_preload_whisper, daemon=True)
+    t.start()
+
 
 APP_NAME = "claude-skill-voice"
 CONFIG_FILENAME = "settings.json"
@@ -75,6 +106,12 @@ FONT_STATUS = ("sans-serif", 16, "bold")
 FONT_TIMER = ("monospace", 24)
 FONT_DETAIL = ("monospace", 9)
 FONT_BUTTON = ("sans-serif", 12)
+
+LEVEL_BAR_WIDTH = 260
+LEVEL_BAR_HEIGHT = 8
+LEVEL_UPDATE_MS = 50
+LEVEL_COLOR = "#888888"
+LEVEL_BG_COLOR = "#d0d0d0"
 
 
 class RecordingError(Exception):
@@ -316,6 +353,7 @@ def record_with_gui(
     pause_start = 0.0
 
     callback_count = [0]
+    current_level = [0.0]  # 0.0–1.0, updated by audio callback
 
     def audio_callback(indata, _frames, _time_info, status):
         callback_count[0] += 1
@@ -323,14 +361,17 @@ def record_with_gui(
             log.warning("audio_callback status: %s", status)
         if recording and not paused:
             chunks.append(indata.copy())
+            peak = int(np.max(np.abs(indata)))
+            current_level[0] = min(peak / 32768.0 * 4.0, 1.0)
             if callback_count[0] % 50 == 0:
-                peak = int(np.max(np.abs(indata)))
                 log.debug(
                     "callback #%d, chunks=%d, peak=%d",
                     callback_count[0],
                     len(chunks),
                     peak,
                 )
+        else:
+            current_level[0] = 0.0
 
     try:
         stream = sd.InputStream(
@@ -391,7 +432,19 @@ def record_with_gui(
 
     device_name = sd.query_devices(device_id)["name"]
     tk.Label(frame, text=f"Mic: {device_name}", font=FONT_DETAIL, fg=COLOR_MUTED).pack(
-        pady=(0, 10)
+        pady=(0, 5)
+    )
+
+    level_canvas = tk.Canvas(
+        frame,
+        width=LEVEL_BAR_WIDTH,
+        height=LEVEL_BAR_HEIGHT,
+        bg=LEVEL_BG_COLOR,
+        highlightthickness=0,
+    )
+    level_canvas.pack(pady=(0, 10))
+    level_bar = level_canvas.create_rectangle(
+        0, 0, 0, LEVEL_BAR_HEIGHT, fill=LEVEL_COLOR, width=0
     )
 
     button_frame = tk.Frame(frame)
@@ -494,11 +547,19 @@ def record_with_gui(
                 transcribe_est_var.set(f"{est_mins}:{est_secs:02d}")
             root.after(TIMER_UPDATE_MS, update_timer)
 
+    def update_level():
+        if recording:
+            level = current_level[0] if not paused else 0.0
+            bar_width = int(level * LEVEL_BAR_WIDTH)
+            level_canvas.coords(level_bar, 0, 0, bar_width, LEVEL_BAR_HEIGHT)
+            root.after(LEVEL_UPDATE_MS, update_level)
+
     root.protocol("WM_DELETE_WINDOW", cancel_recording)
 
     try:
         stream.start()
         update_timer()
+        update_level()
         root.mainloop()
     finally:
         stream.stop()
@@ -538,12 +599,20 @@ def save_wav(audio_data: np.ndarray) -> str:
 def transcribe(wav_path: str, *, model_size: str = DEFAULT_MODEL_SIZE) -> str:
     """Transcribe WAV file using faster-whisper."""
     log.info("Transcribing with model '%s'...", model_size)
+    if _whisper_preload_started:
+        _whisper_module_ready.wait()
+    model_cls = _WhisperModel if _whisper_preload_started and _WhisperModel else None
+    if model_cls is None:
+        from faster_whisper import WhisperModel as _WM
+
+        model_cls = _WM
+
     # Suppress stdout from ctranslate2/faster-whisper progress output
     devnull = open(os.devnull, "w")  # noqa: SIM115
     saved_stdout = sys.stdout
     sys.stdout = devnull
     try:
-        model = WhisperModel(
+        model = model_cls(
             model_size, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE
         )
         segments, _ = model.transcribe(wav_path, beam_size=WHISPER_BEAM_SIZE)
@@ -611,6 +680,8 @@ def main() -> None:
         sys.exit(EXIT_ERROR)
 
     try:
+        # Start importing faster-whisper in background while user records
+        start_whisper_preload()
         cfg = Config()
         cwd = os.getcwd()
         try:
