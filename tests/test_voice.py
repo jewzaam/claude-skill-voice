@@ -74,7 +74,6 @@ class TestConfig:
         cfg = voice.Config(str(tmp_path / "nonexistent.json"))
         assert cfg.window_x is None
         assert cfg.window_y is None
-        assert cfg.transcribe_ratio is None
 
     def test_loads_window_position(self, tmp_path):
         path = tmp_path / "settings.json"
@@ -148,42 +147,6 @@ class TestConfig:
         cfg.save()
         data = json.loads(path.read_text())
         assert data["window_x"] == 10
-
-    def test_transcribe_ratio_loads(self, tmp_path):
-        path = tmp_path / "settings.json"
-        path.write_text(json.dumps({"transcribe_ratio": 0.045}))
-        cfg = voice.Config(str(path))
-        assert cfg.transcribe_ratio == pytest.approx(0.045)
-
-    def test_transcribe_ratio_rejects_zero(self, tmp_path):
-        path = tmp_path / "settings.json"
-        path.write_text(json.dumps({"transcribe_ratio": 0}))
-        cfg = voice.Config(str(path))
-        assert cfg.transcribe_ratio is None
-
-    def test_transcribe_ratio_rejects_negative(self, tmp_path):
-        path = tmp_path / "settings.json"
-        path.write_text(json.dumps({"transcribe_ratio": -0.5}))
-        cfg = voice.Config(str(path))
-        assert cfg.transcribe_ratio is None
-
-    def test_transcribe_ratio_roundtrip(self, tmp_path):
-        path = tmp_path / "settings.json"
-        cfg = voice.Config(str(path))
-        cfg.transcribe_ratio = 0.0523
-        cfg.save()
-        cfg2 = voice.Config(str(path))
-        assert cfg2.transcribe_ratio == pytest.approx(0.0523)
-
-    def test_transcribe_ratio_preserves_other_keys(self, tmp_path):
-        path = tmp_path / "settings.json"
-        path.write_text(json.dumps({"window_x": 100}))
-        cfg = voice.Config(str(path))
-        cfg.transcribe_ratio = 0.03
-        cfg.save()
-        data = json.loads(path.read_text())
-        assert data["window_x"] == 100
-        assert data["transcribe_ratio"] == pytest.approx(0.03)
 
 
 class TestTruncatePath:
@@ -264,7 +227,7 @@ class TestGetInputDevices:
 class TestSaveWav:
     def test_creates_valid_wav(self):
         audio_data = np.zeros(16000, dtype=np.int16)
-        wav_path = voice.save_wav(audio_data)
+        wav_path = whisper_mod.save_wav(audio_data)
         try:
             assert os.path.exists(wav_path)
             assert wav_path.startswith(tempfile.gettempdir())
@@ -273,7 +236,7 @@ class TestSaveWav:
             with wave.open(wav_path, "rb") as wf:
                 assert wf.getnchannels() == 1
                 assert wf.getsampwidth() == 2
-                assert wf.getframerate() == voice.SAMPLE_RATE
+                assert wf.getframerate() == whisper_mod.SAMPLE_RATE
                 assert wf.getnframes() == 16000
         finally:
             if os.path.exists(wav_path):
@@ -281,8 +244,8 @@ class TestSaveWav:
 
     def test_unique_filenames(self):
         audio_data = np.zeros(100, dtype=np.int16)
-        path1 = voice.save_wav(audio_data)
-        path2 = voice.save_wav(audio_data)
+        path1 = whisper_mod.save_wav(audio_data)
+        path2 = whisper_mod.save_wav(audio_data)
         try:
             assert path1 != path2
         finally:
@@ -443,7 +406,7 @@ class TestAcquireReleaseLock:
         lock.write_text(str(os.getppid()))
         with (
             patch("voice._lock_path", return_value=str(lock)),
-            patch("voice.log") as mock_log,
+            patch("voice.logger") as mock_log,
         ):
             voice._release_lock()
         mock_log.warning.assert_called_once()
@@ -643,7 +606,7 @@ class TestTranscribeErrorHandling:
                 "whisper._get_or_create_model",
                 side_effect=RuntimeError("connection refused"),
             ),
-            patch("whisper.log") as mock_log,
+            patch("whisper.logger") as mock_log,
         ):
             with pytest.raises(RuntimeError):
                 whisper_mod.transcribe_wav("/tmp/test.wav", model_size="small")
@@ -695,7 +658,9 @@ class TestMain:
             assert exc_info.value.code == voice.EXIT_SUCCESS
 
         captured = capsys.readouterr()
-        assert captured.out.strip() == "[DONE]"
+        lines = captured.out.strip().split("\n")
+        assert lines[0] == "[BEGIN]"
+        assert lines[1] == "[END]"
 
     def test_recording_error_exits_nonzero(self):
         _, mock_mgr = _mock_chunk_manager()
@@ -744,8 +709,9 @@ class TestMain:
 
         captured = capsys.readouterr()
         lines = captured.out.strip().split("\n")
-        assert lines[0] == "[DONE]"
+        assert lines[0] == "[BEGIN]"
         assert lines[1] == "hello world"
+        assert lines[2] == "[END]"
 
     def test_list_devices_flag(self):
         mock_devices = [
@@ -852,7 +818,7 @@ class TestMain:
             voice.main()
 
         captured = capsys.readouterr()
-        assert captured.out.strip() == "[DONE]"
+        assert captured.out.strip() == "[END]"
         assert "already streamed" not in captured.out
 
 
@@ -994,100 +960,18 @@ class TestTranscribeProgressCallback:
         assert fractions == [1.0]
 
 
-class TestTranscribeWithProgress:
-    """Tests for transcribe_with_progress() which reuses a tk.Tk root.
-
-    These tests mock tkinter widgets and whisper.transcribe_wav but let real
-    threading run. The mock mainloop returns immediately; the background
-    thread completes near-instantly with a mocked transcribe.
-    """
-
-    def _make_root(self, children=None):
-        mock_root = MagicMock()
-        mock_root.winfo_children.return_value = children or []
-        mock_root.mainloop.return_value = None
-        return mock_root
-
-    def _call(
-        self, mock_root, transcribe_return="", transcribe_side_effect=None, **kwargs
-    ):
-        with (
-            patch("voice.tk.Frame", return_value=MagicMock()),
-            patch("voice.tk.Label", return_value=MagicMock()),
-            patch("voice.tk.StringVar", return_value=MagicMock()),
-            patch("voice.tk.Canvas", return_value=MagicMock()),
-            patch(
-                "voice.transcribe_wav",
-                return_value=transcribe_return,
-                side_effect=transcribe_side_effect,
-            ) as mock_transcribe,
-        ):
-            result = voice.transcribe_with_progress(
-                "/tmp/test.wav", root=mock_root, **kwargs
-            )
-            return result, mock_transcribe
-
-    def test_clears_existing_widgets(self):
-        child1, child2 = MagicMock(), MagicMock()
-        mock_root = self._make_root(children=[child1, child2])
-
-        result, _ = self._call(mock_root, transcribe_return="hello")
-
-        child1.destroy.assert_called_once()
-        child2.destroy.assert_called_once()
-        assert result == "hello"
-
-    def test_destroys_root_when_done(self):
-        mock_root = self._make_root()
-        self._call(mock_root, transcribe_return="result")
-        mock_root.destroy.assert_called()
-
-    def test_raises_transcription_error(self):
-        mock_root = self._make_root()
-
-        with pytest.raises(RuntimeError, match="model load failed"):
-            self._call(
-                mock_root,
-                transcribe_side_effect=RuntimeError("model load failed"),
-            )
-
-    def test_passes_model_size_to_transcribe(self):
-        mock_root = self._make_root()
-        _, mock_transcribe = self._call(
-            mock_root, transcribe_return="hi", model_size="tiny"
-        )
-        mock_transcribe.assert_called_once()
-        assert mock_transcribe.call_args[1]["model_size"] == "tiny"
-
-    def test_returns_empty_string_on_none_result(self):
-        mock_root = self._make_root()
-        result, _ = self._call(mock_root, transcribe_return="")
-        assert result == ""
-
-    def test_disables_window_close(self):
-        mock_root = self._make_root()
-        self._call(mock_root, transcribe_return="hi")
-
-        protocol_calls = [
-            c
-            for c in mock_root.protocol.call_args_list
-            if c[0][0] == "WM_DELETE_WINDOW"
-        ]
-        assert len(protocol_calls) == 1
-
-
 @pytest.mark.usefixtures("_no_lock", "_reset_whisper_globals")
 class TestWavInputOutput:
     """Tests for --wav-input and --wav-output flags."""
 
     def _make_wav(self, path, duration_seconds=1.0):
         """Create a valid WAV file at the given path."""
-        n_samples = int(voice.SAMPLE_RATE * duration_seconds)
+        n_samples = int(whisper_mod.SAMPLE_RATE * duration_seconds)
         audio = np.zeros(n_samples, dtype=np.int16)
         with wave.open(str(path), "wb") as wf:
-            wf.setnchannels(voice.AUDIO_CHANNELS)
-            wf.setsampwidth(voice.AUDIO_SAMPLE_WIDTH)
-            wf.setframerate(voice.SAMPLE_RATE)
+            wf.setnchannels(whisper_mod.AUDIO_CHANNELS)
+            wf.setsampwidth(whisper_mod.AUDIO_SAMPLE_WIDTH)
+            wf.setframerate(whisper_mod.SAMPLE_RATE)
             wf.writeframes(audio.tobytes())
 
     def test_wav_input_transcribes_existing_file(self, tmp_path, capsys):
@@ -1140,8 +1024,8 @@ class TestWavInputOutput:
                 voice.main()
             assert exc_info.value.code == voice.EXIT_ERROR
 
-    def test_wav_input_no_status_line(self, tmp_path, capsys):
-        """--wav-input output has no [DONE]/[CANCEL] status line."""
+    def test_wav_input_uses_begin_end_markers(self, tmp_path, capsys):
+        """--wav-input output uses [BEGIN]/[END] markers."""
         wav_file = str(tmp_path / "test.wav")
         self._make_wav(wav_file)
 
@@ -1159,7 +1043,9 @@ class TestWavInputOutput:
                 voice.main()
 
         captured = capsys.readouterr()
-        assert "[DONE]" not in captured.out
+        lines = captured.out.strip().split("\n")
+        assert lines[0] == "[BEGIN]"
+        assert lines[-1] == "[END]"
         assert "[CANCEL]" not in captured.out
 
     def test_wav_input_skips_lock(self, tmp_path):
@@ -1223,5 +1109,6 @@ class TestWavInputOutput:
 
         captured = capsys.readouterr()
         lines = captured.out.strip().split("\n")
-        assert lines[0] == "[DONE]"
+        assert lines[0] == "[BEGIN]"
         assert lines[1] == "hello world"
+        assert lines[2] == "[END]"

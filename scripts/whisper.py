@@ -17,7 +17,7 @@ import numpy as np
 
 from typing import Callable
 
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 SAMPLE_RATE = 16000
 AUDIO_CHANNELS = 1
@@ -104,15 +104,20 @@ def _get_or_create_model(model_size: str = DEFAULT_MODEL_SIZE):
     return model
 
 
-def _save_temp_wav(audio_data: np.ndarray) -> str:
-    """Save audio to a temporary WAV file. Returns the path."""
-    file_id = uuid.uuid4().hex[:8]
-    wav_path = os.path.join(tempfile.gettempdir(), f"claude_voice_{file_id}.wav")
-    with wave.open(wav_path, "wb") as wf:
+def save_wav_to(audio_data: np.ndarray, path: str) -> None:
+    """Save audio data to a WAV file at the given path."""
+    with wave.open(path, "wb") as wf:
         wf.setnchannels(AUDIO_CHANNELS)
         wf.setsampwidth(AUDIO_SAMPLE_WIDTH)
         wf.setframerate(SAMPLE_RATE)
         wf.writeframes(audio_data.tobytes())
+
+
+def save_wav(audio_data: np.ndarray) -> str:
+    """Save audio to a temporary WAV file. Returns the path."""
+    file_id = uuid.uuid4().hex[:8]
+    wav_path = os.path.join(tempfile.gettempdir(), f"claude_voice_{file_id}.wav")
+    save_wav_to(audio_data, wav_path)
     return wav_path
 
 
@@ -130,7 +135,7 @@ def transcribe_wav(
         progress_callback: Called with progress fraction (0.0-1.0) after each
             segment, based on segment end time / audio duration.
     """
-    log.info("Transcribing with model '%s'...", model_size)
+    logger.info("Transcribing with model '%s'...", model_size)
 
     # Get audio duration for progress tracking
     audio_duration = 0.0
@@ -158,7 +163,7 @@ def transcribe_wav(
             sys.stdout = saved_stdout
             devnull.close()
     except Exception as e:
-        log.error(
+        logger.error(
             "Failed to load Whisper model '%s': %s\n"
             "Ensure faster-whisper is installed and you have internet "
             "connectivity for initial model download.",
@@ -175,15 +180,18 @@ def transcribe_audio(
     audio_data: np.ndarray,
     *,
     model_size: str = DEFAULT_MODEL_SIZE,
+    progress_callback: Callable[[float], None] | None = None,
 ) -> str:
     """Transcribe raw audio data (int16 numpy array) using faster-whisper.
 
     Saves to a temp WAV, transcribes, and cleans up. Used by ChunkManager
     for individual chunks.
     """
-    wav_path = _save_temp_wav(audio_data)
+    wav_path = save_wav(audio_data)
     try:
-        return transcribe_wav(wav_path, model_size=model_size)
+        return transcribe_wav(
+            wav_path, model_size=model_size, progress_callback=progress_callback
+        )
     finally:
         if os.path.exists(wav_path):
             os.remove(wav_path)

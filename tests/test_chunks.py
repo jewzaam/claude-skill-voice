@@ -9,7 +9,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
-from chunks import ChunkManager, SilenceDetector  # noqa: E402
+from chunks import ChunkManager, SilenceDetector, trim_silence  # noqa: E402
 
 
 class TestSilenceDetector:
@@ -17,9 +17,9 @@ class TestSilenceDetector:
 
     def _make_detector(self, **overrides):
         defaults = dict(
-            threshold=0.02,
-            duration_s=1.5,
-            min_chunk_s=3.0,
+            threshold=0.08,
+            duration_s=1.0,
+            min_chunk_s=1.0,
             buffer_s=0.5,
             callback_interval_s=0.01,
         )
@@ -168,8 +168,11 @@ class TestChunkManager:
     """Tests for background chunked transcription."""
 
     def _make_chunks(self, *durations_samples):
-        """Create list of numpy audio chunks with given sample counts."""
-        return [np.ones((n, 1), dtype=np.int16) for n in durations_samples]
+        """Create list of numpy audio chunks with given sample counts.
+
+        Uses peak=2000 which maps to level=0.24 (above silence threshold).
+        """
+        return [np.full((n, 1), 2000, dtype=np.int16) for n in durations_samples]
 
     def test_bind_chunks(self):
         mgr = ChunkManager(model_size="tiny")
@@ -179,17 +182,17 @@ class TestChunkManager:
 
     def test_flush_enqueues_audio(self):
         mgr = ChunkManager(model_size="tiny")
-        chunks = self._make_chunks(100, 200, 300)
+        chunks = self._make_chunks(8000, 8000, 8000)
         mgr.bind_chunks(chunks)
         result = mgr.flush()
         assert result is True
         assert mgr._queue.qsize() == 1
         # Boundary moved
-        assert mgr._boundary == 3
+        assert mgr.boundary == 3
 
     def test_flush_no_new_audio_is_noop(self):
         mgr = ChunkManager(model_size="tiny")
-        chunks = self._make_chunks(100)
+        chunks = self._make_chunks(16000)
         mgr.bind_chunks(chunks)
         mgr.flush()
         # Second flush with no new chunks
@@ -199,27 +202,27 @@ class TestChunkManager:
 
     def test_flush_with_boundary(self):
         mgr = ChunkManager(model_size="tiny")
-        chunks = self._make_chunks(100, 200, 300, 400)
+        chunks = self._make_chunks(8000, 8000, 8000, 8000)
         mgr.bind_chunks(chunks)
         # Flush only first 2 chunks
         mgr.flush(boundary=2)
-        assert mgr._boundary == 2
+        assert mgr.boundary == 2
         assert mgr._queue.qsize() == 1
         # Flush remaining
         mgr.flush()
-        assert mgr._boundary == 4
+        assert mgr.boundary == 4
         assert mgr._queue.qsize() == 2
 
     def test_flush_boundary_clamped_to_length(self):
         mgr = ChunkManager(model_size="tiny")
-        chunks = self._make_chunks(100, 200)
+        chunks = self._make_chunks(8000, 8000)
         mgr.bind_chunks(chunks)
         mgr.flush(boundary=999)
-        assert mgr._boundary == 2  # clamped to len(chunks)
+        assert mgr.boundary == 2  # clamped to len(chunks)
 
     def test_worker_transcribes_and_stores(self):
         mgr = ChunkManager(model_size="tiny")
-        chunks = self._make_chunks(1600)
+        chunks = self._make_chunks(16000)
         mgr.bind_chunks(chunks)
 
         with patch("chunks.transcribe_audio", return_value="hello world"):
@@ -231,12 +234,12 @@ class TestChunkManager:
 
     def test_worker_multiple_chunks(self):
         mgr = ChunkManager(model_size="tiny")
-        chunks = self._make_chunks(1600, 1600, 1600)
+        chunks = self._make_chunks(16000, 16000, 16000)
         mgr.bind_chunks(chunks)
 
         call_count = [0]
 
-        def fake_transcribe(audio_data, *, model_size="small"):
+        def fake_transcribe(audio_data, *, model_size="small", progress_callback=None):
             call_count[0] += 1
             return f"chunk{call_count[0]}"
 
@@ -251,7 +254,7 @@ class TestChunkManager:
 
     def test_worker_skips_empty_transcripts(self):
         mgr = ChunkManager(model_size="tiny")
-        chunks = self._make_chunks(1600, 1600)
+        chunks = self._make_chunks(16000, 16000)
         mgr.bind_chunks(chunks)
 
         results = iter(["", "hello"])
@@ -268,12 +271,14 @@ class TestChunkManager:
 
     def test_worker_error_logged_and_continues(self):
         mgr = ChunkManager(model_size="tiny")
-        chunks = self._make_chunks(1600, 1600)
+        chunks = self._make_chunks(16000, 16000)
         mgr.bind_chunks(chunks)
 
         call_count = [0]
 
-        def fail_then_succeed(audio_data, *, model_size="small"):
+        def fail_then_succeed(
+            audio_data, *, model_size="small", progress_callback=None
+        ):
             call_count[0] += 1
             if call_count[0] == 1:
                 raise RuntimeError("model exploded")
@@ -290,7 +295,7 @@ class TestChunkManager:
 
     def test_stream_callback_called(self):
         mgr = ChunkManager(model_size="tiny")
-        chunks = self._make_chunks(1600)
+        chunks = self._make_chunks(16000)
         mgr.bind_chunks(chunks)
 
         streamed = []
@@ -305,7 +310,7 @@ class TestChunkManager:
 
     def test_stream_callback_not_called_for_empty(self):
         mgr = ChunkManager(model_size="tiny")
-        chunks = self._make_chunks(1600)
+        chunks = self._make_chunks(16000)
         mgr.bind_chunks(chunks)
 
         streamed = []
@@ -318,31 +323,51 @@ class TestChunkManager:
 
         assert streamed == []
 
-    def test_progress_fraction(self):
+    def test_progress_fraction_all_transcribed(self):
         mgr = ChunkManager(model_size="tiny", sample_rate=16000)
         chunks = self._make_chunks(16000, 16000)  # 2 chunks, 1s each
         mgr.bind_chunks(chunks)
 
         with patch("chunks.transcribe_audio", return_value="text"):
             mgr.start_worker()
-            mgr.flush(boundary=1)
+            mgr.flush()  # flush all
             mgr.finish(timeout=5)
 
-        # Transcribed 16000 samples, total sent 16000
+        # All 32000 samples transcribed out of 32000 recorded
         assert mgr.progress_fraction() == 1.0
 
-    def test_progress_fraction_partial(self):
+    def test_progress_fraction_partial_flush(self):
+        import threading as th
+
         mgr = ChunkManager(model_size="tiny", sample_rate=16000)
         chunks = self._make_chunks(16000, 16000)
         mgr.bind_chunks(chunks)
-        # Flush both but don't start worker — nothing transcribed
+
+        chunk_processed = th.Event()
+
+        def mock_transcribe(audio_data, *, model_size="small", progress_callback=None):
+            chunk_processed.set()
+            return "text"
+
+        with patch("chunks.transcribe_audio", side_effect=mock_transcribe):
+            mgr.start_worker()
+            mgr.flush(boundary=1)  # flush only first chunk
+            chunk_processed.wait(timeout=5)
+
+        # 16000 transcribed out of 32000 recorded = 0.5
+        assert mgr.progress_fraction() == 0.5
+
+    def test_progress_fraction_nothing_transcribed(self):
+        mgr = ChunkManager(model_size="tiny", sample_rate=16000)
+        chunks = self._make_chunks(16000, 16000)
+        mgr.bind_chunks(chunks)
+        # Flush but don't start worker — nothing transcribed
         mgr.flush()
-        assert mgr._total_samples_sent > 0
         assert mgr.progress_fraction() == 0.0
 
     def test_is_done(self):
         mgr = ChunkManager(model_size="tiny")
-        chunks = self._make_chunks(1600)
+        chunks = self._make_chunks(16000)
         mgr.bind_chunks(chunks)
 
         with patch("chunks.transcribe_audio", return_value="done"):
@@ -354,8 +379,69 @@ class TestChunkManager:
 
     def test_finish_without_start_is_safe(self):
         mgr = ChunkManager(model_size="tiny")
-        chunks = self._make_chunks(1600)
+        chunks = self._make_chunks(16000)
         mgr.bind_chunks(chunks)
         # finish without starting worker — should not raise
         mgr.finish(timeout=1)
         assert mgr.get_transcript() == ""
+
+
+class TestTrimSilence:
+    """Tests for trim_silence()."""
+
+    def _make_audio(self, *segments):
+        """Build audio from (level, duration_samples) pairs.
+
+        level=0.0 produces silence, level>0 produces samples at that peak.
+        """
+        parts = []
+        for level, n_samples in segments:
+            if level == 0.0:
+                parts.append(np.zeros((n_samples, 1), dtype=np.int16))
+            else:
+                peak = int(level / 4.0 * 32768)
+                parts.append(np.full((n_samples, 1), peak, dtype=np.int16))
+        return np.concatenate(parts, axis=0)
+
+    def test_all_silence_returns_none(self):
+        audio = self._make_audio((0.0, 16000))
+        assert trim_silence(audio) is None
+
+    def test_speech_only_unchanged(self):
+        audio = self._make_audio((0.5, 16000))
+        result = trim_silence(audio, buffer_s=0.0)
+        assert result is not None
+        assert len(result) == len(audio)
+
+    def test_trims_leading_silence(self):
+        # 1s silence + 1s speech
+        audio = self._make_audio((0.0, 16000), (0.5, 16000))
+        result = trim_silence(audio, buffer_s=0.0)
+        assert result is not None
+        assert len(result) < len(audio)
+        # Should start near the speech, not at the beginning
+        assert len(result) <= 16400  # speech + some block alignment
+
+    def test_trims_trailing_silence(self):
+        # 1s speech + 1s silence
+        audio = self._make_audio((0.5, 16000), (0.0, 16000))
+        result = trim_silence(audio, buffer_s=0.0)
+        assert result is not None
+        assert len(result) < len(audio)
+        assert len(result) <= 16400
+
+    def test_trims_both_ends(self):
+        # 1s silence + 1s speech + 1s silence
+        audio = self._make_audio((0.0, 16000), (0.5, 16000), (0.0, 16000))
+        result = trim_silence(audio, buffer_s=0.0)
+        assert result is not None
+        assert len(result) < 20000  # much less than 48000
+
+    def test_buffer_preserves_padding(self):
+        # 2s silence + 1s speech + 2s silence
+        audio = self._make_audio((0.0, 32000), (0.5, 16000), (0.0, 32000))
+        result = trim_silence(audio, buffer_s=0.5)
+        assert result is not None
+        # Should be speech (16000) + 2x buffer (2x8000) = ~32000, plus block alignment
+        assert len(result) > 16000
+        assert len(result) < len(audio)
