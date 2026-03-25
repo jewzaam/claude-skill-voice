@@ -154,12 +154,18 @@ class ChunkManager:
         return True
 
     def finish(self, timeout: float = 30.0) -> None:
-        """Flush remaining audio, signal worker to stop, and wait."""
+        """Flush remaining audio, signal worker to stop, and optionally wait.
+
+        The worker sets _finished when it exits. Use timeout=0 to send the
+        sentinel without blocking (for async polling via is_done()).
+        """
         self.flush()
         if self._worker is not None:
             self._queue.put(None)  # sentinel
-            self._worker.join(timeout=timeout)
-        self._finished.set()
+            if timeout > 0:
+                self._worker.join(timeout=timeout)
+        else:
+            self._finished.set()
 
     def get_transcript(self) -> str:
         """Join all completed transcripts."""
@@ -177,18 +183,21 @@ class ChunkManager:
 
     def _worker_loop(self) -> None:
         """Process chunks from the queue until sentinel."""
-        while True:
-            item = self._queue.get()
-            if item is None:
-                break
-            try:
-                text = transcribe_audio(item, model_size=self._model_size)
-                if text:
-                    self._transcripts.append(text)
-                    if self._stream_callback:
-                        self._stream_callback(text)
-                self._total_samples_done += len(item)
-            except Exception as e:
-                log.error("Chunk transcription failed: %s", e)
-                self._errors.append(e)
-                self._total_samples_done += len(item)
+        try:
+            while True:
+                item = self._queue.get()
+                if item is None:
+                    break
+                try:
+                    text = transcribe_audio(item, model_size=self._model_size)
+                    if text:
+                        self._transcripts.append(text)
+                        if self._stream_callback:
+                            self._stream_callback(text)
+                    self._total_samples_done += len(item)
+                except Exception as e:
+                    log.error("Chunk transcription failed: %s", e)
+                    self._errors.append(e)
+                    self._total_samples_done += len(item)
+        finally:
+            self._finished.set()

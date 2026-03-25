@@ -40,6 +40,7 @@ import threading
 import numpy as np
 import sounddevice as sd
 
+from chunks import ChunkManager, SilenceDetector  # noqa: F401
 from whisper import AUDIO_CHANNELS  # noqa: F401
 from whisper import AUDIO_SAMPLE_WIDTH  # noqa: F401
 from whisper import DEFAULT_MODEL_SIZE  # noqa: F401
@@ -91,6 +92,11 @@ PROGRESS_COLOR = COLOR_DONE
 PROGRESS_BG_COLOR = "#d0d0d0"
 PROGRESS_UPDATE_MS = 200
 COLOR_TRANSCRIBING = "#4477cc"
+
+CHUNK_PROGRESS_HEIGHT = 6
+CHUNK_PROGRESS_COLOR = COLOR_TRANSCRIBING
+CHUNK_STATUS_UPDATE_MS = 300
+TRANSCRIBING_POLL_MS = 200
 
 
 class RecordingError(Exception):
@@ -322,13 +328,22 @@ def _get_input_devices() -> list[dict]:
 
 
 def record_with_gui(
-    cwd: str, *, device_id: int | None = None, config: Config | None = None
+    cwd: str,
+    *,
+    device_id: int | None = None,
+    config: Config | None = None,
+    chunk_manager: ChunkManager | None = None,
 ) -> tuple[np.ndarray, tk.Tk]:
     """Show a tkinter popup while recording. Returns (audio_data, root).
 
     On Done, the root window stays alive (mainloop exits via quit()) so it
     can be reused for the transcription progress display. The caller is
     responsible for eventually calling root.destroy().
+
+    When chunk_manager is provided, audio is transcribed in the background
+    during recording. Pause triggers a chunk flush. Silence detection
+    triggers automatic flushes. On Done, the window transitions to
+    "Transcribing..." mode and closes when the worker finishes.
 
     On Cancel, the root is destroyed and RecordingCancelled is raised.
 
@@ -352,6 +367,13 @@ def record_with_gui(
 
     callback_count = [0]
     current_level = [0.0]  # 0.0–1.0, updated by audio callback
+    silence_flush_boundary = [None]  # set by callback, read by level timer
+
+    # Set up chunked transcription if manager provided
+    silence_detector: SilenceDetector | None = None
+    if chunk_manager is not None:
+        chunk_manager.bind_chunks(chunks)
+        silence_detector = SilenceDetector()
 
     def audio_callback(indata, _frames, _time_info, status):
         callback_count[0] += 1
@@ -368,6 +390,16 @@ def record_with_gui(
                     len(chunks),
                     peak,
                 )
+            # Feed silence detector (non-blocking, pure arithmetic)
+            if silence_detector is not None and chunk_manager is not None:
+                accumulated_s = (
+                    (len(chunks) - chunk_manager._boundary) * len(indata) / SAMPLE_RATE
+                )
+                boundary = silence_detector.feed(
+                    current_level[0], len(chunks) - 1, accumulated_s
+                )
+                if boundary is not None:
+                    silence_flush_boundary[0] = boundary
         else:
             current_level[0] = 0.0
 
@@ -440,10 +472,27 @@ def record_with_gui(
         bg=LEVEL_BG_COLOR,
         highlightthickness=0,
     )
-    level_canvas.pack(pady=(0, 10))
+    level_canvas.pack(pady=(0, 3))
     level_bar = level_canvas.create_rectangle(
         0, 0, 0, LEVEL_BAR_HEIGHT, fill=LEVEL_COLOR, width=0
     )
+
+    # Chunk transcription progress bar (only visible when chunk_manager active)
+    chunk_progress_canvas = tk.Canvas(
+        frame,
+        width=LEVEL_BAR_WIDTH,
+        height=CHUNK_PROGRESS_HEIGHT,
+        bg=PROGRESS_BG_COLOR,
+        highlightthickness=0,
+    )
+    chunk_progress_bar = chunk_progress_canvas.create_rectangle(
+        0, 0, 0, CHUNK_PROGRESS_HEIGHT, fill=CHUNK_PROGRESS_COLOR, width=0
+    )
+    if chunk_manager is not None:
+        chunk_progress_canvas.pack(pady=(0, 10))
+    else:
+        chunk_progress_canvas.pack(pady=(0, 10))
+        chunk_progress_canvas.pack_forget()  # hidden when no chunking
 
     button_frame = tk.Frame(frame)
     button_frame.pack()
@@ -482,8 +531,14 @@ def record_with_gui(
             status_var.set("Recording:")
             status_label.config(fg=COLOR_RECORDING)
             pause_btn.config(text="Pause")
+            if silence_detector is not None:
+                silence_detector.reset()
             update_timer()
         else:
+            # Flush accumulated audio before pausing
+            if chunk_manager is not None:
+                chunk_manager.flush()
+                silence_flush_boundary[0] = None
             pause_start = time.time()
             paused = True
             status_var.set("Paused:")
@@ -495,6 +550,37 @@ def record_with_gui(
         recording = False
         _cancel_pending_afters()
         _save_window_pos()
+
+        if chunk_manager is not None:
+            # Transition to "Transcribing..." mode in same window
+            chunk_manager.flush()  # flush remaining audio
+            chunk_manager.finish(timeout=0)  # send sentinel, don't block
+
+            # Gray out buttons
+            pause_btn.config(state=tk.DISABLED)
+            done_btn.config(state=tk.DISABLED)
+            status_var.set("Transcribing:")
+            status_label.config(fg=COLOR_TRANSCRIBING)
+
+            # Hide level bar, show chunk progress
+            level_canvas.pack_forget()
+            current_level[0] = 0.0
+
+            def poll_transcription():
+                frac = chunk_manager.progress_fraction()
+                bar_w = int(frac * LEVEL_BAR_WIDTH)
+                chunk_progress_canvas.coords(
+                    chunk_progress_bar, 0, 0, bar_w, CHUNK_PROGRESS_HEIGHT
+                )
+                if chunk_manager.is_done():
+                    root.quit()
+                else:
+                    after_id = root.after(TRANSCRIBING_POLL_MS, poll_transcription)
+                    pending_after_ids.append(after_id)
+
+            poll_transcription()
+            return  # stay in mainloop
+
         root.quit()  # exit mainloop but keep window alive for progress
 
     btn_width = 7
@@ -564,6 +650,22 @@ def record_with_gui(
             level = current_level[0] if not paused else 0.0
             bar_width = int(level * LEVEL_BAR_WIDTH)
             level_canvas.coords(level_bar, 0, 0, bar_width, LEVEL_BAR_HEIGHT)
+
+            # Check silence-triggered flush (set by audio callback)
+            if chunk_manager is not None and silence_flush_boundary[0] is not None:
+                boundary = silence_flush_boundary[0]
+                silence_flush_boundary[0] = None
+                chunk_manager.flush(boundary=boundary)
+                log.debug("silence flush at boundary %d", boundary)
+
+            # Update chunk progress bar
+            if chunk_manager is not None:
+                frac = chunk_manager.progress_fraction()
+                bar_w = int(frac * LEVEL_BAR_WIDTH)
+                chunk_progress_canvas.coords(
+                    chunk_progress_bar, 0, 0, bar_w, CHUNK_PROGRESS_HEIGHT
+                )
+
             after_id = root.after(LEVEL_UPDATE_MS, update_level)
             pending_after_ids.append(after_id)
 
