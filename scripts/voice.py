@@ -36,6 +36,7 @@ except ModuleNotFoundError:
     sys.exit(1)
 
 import threading
+from typing import Callable
 
 import numpy as np
 import sounddevice as sd
@@ -83,7 +84,7 @@ SAMPLE_RATE = 16000
 AUDIO_CHANNELS = 1
 AUDIO_DTYPE = "int16"
 AUDIO_SAMPLE_WIDTH = 2
-DEFAULT_MODEL_SIZE = "base"
+DEFAULT_MODEL_SIZE = "small"
 WHISPER_BEAM_SIZE = 5
 WHISPER_DEVICE = "cpu"
 WHISPER_COMPUTE_TYPE = "int8"
@@ -112,6 +113,13 @@ LEVEL_BAR_HEIGHT = 8
 LEVEL_UPDATE_MS = 50
 LEVEL_COLOR = "#888888"
 LEVEL_BG_COLOR = "#d0d0d0"
+
+PROGRESS_BAR_WIDTH = 260
+PROGRESS_BAR_HEIGHT = 18
+PROGRESS_COLOR = COLOR_DONE
+PROGRESS_BG_COLOR = "#d0d0d0"
+PROGRESS_UPDATE_MS = 200
+COLOR_TRANSCRIBING = "#4477cc"
 
 
 class RecordingError(Exception):
@@ -199,6 +207,19 @@ def _lock_path() -> str:
 
 def _is_pid_alive(pid: int) -> bool:
     """Check if a process with the given PID is running."""
+    if sys.platform == "win32":
+        # os.kill(pid, 0) on Windows sends CTRL_C_EVENT (signal 0) to the
+        # console process group, which kills the caller. Use OpenProcess instead.
+        import ctypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+        )
+        if handle:
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        return False
     try:
         os.kill(pid, 0)  # signal 0: check existence, does not kill
         return True
@@ -331,8 +352,14 @@ def _get_input_devices() -> list[dict]:
 
 def record_with_gui(
     cwd: str, *, device_id: int | None = None, config: Config | None = None
-) -> np.ndarray:
-    """Show a tkinter popup while recording. Returns audio data.
+) -> tuple[np.ndarray, tk.Tk]:
+    """Show a tkinter popup while recording. Returns (audio_data, root).
+
+    On Done, the root window stays alive (mainloop exits via quit()) so it
+    can be reused for the transcription progress display. The caller is
+    responsible for eventually calling root.destroy().
+
+    On Cancel, the root is destroyed and RecordingCancelled is raised.
 
     Raises:
         RecordingError: If no audio was captured.
@@ -450,20 +477,31 @@ def record_with_gui(
     button_frame = tk.Frame(frame)
     button_frame.pack()
 
-    def _save_pos_and_destroy():
+    pending_after_ids: list[str] = []
+
+    def _cancel_pending_afters():
+        for after_id in pending_after_ids:
+            try:
+                root.after_cancel(after_id)
+            except Exception:
+                pass
+        pending_after_ids.clear()
+
+    def _save_window_pos():
         try:
             config.window_x = root.winfo_x()
             config.window_y = root.winfo_y()
             config.save()
         except Exception:
             pass
-        root.destroy()
 
     def cancel_recording():
         nonlocal recording, cancelled
         recording = False
         cancelled = True
-        _save_pos_and_destroy()
+        _cancel_pending_afters()
+        _save_window_pos()
+        root.destroy()
 
     def toggle_pause():
         nonlocal paused, pause_start, paused_elapsed
@@ -484,7 +522,9 @@ def record_with_gui(
     def done_recording():
         nonlocal recording
         recording = False
-        _save_pos_and_destroy()
+        _cancel_pending_afters()
+        _save_window_pos()
+        root.quit()  # exit mainloop but keep window alive for progress
 
     btn_width = 7
 
@@ -545,14 +585,16 @@ def record_with_gui(
                 est = int(elapsed * saved_ratio)
                 est_mins, est_secs = divmod(est, 60)
                 transcribe_est_var.set(f"{est_mins}:{est_secs:02d}")
-            root.after(TIMER_UPDATE_MS, update_timer)
+            after_id = root.after(TIMER_UPDATE_MS, update_timer)
+            pending_after_ids.append(after_id)
 
     def update_level():
         if recording:
             level = current_level[0] if not paused else 0.0
             bar_width = int(level * LEVEL_BAR_WIDTH)
             level_canvas.coords(level_bar, 0, 0, bar_width, LEVEL_BAR_HEIGHT)
-            root.after(LEVEL_UPDATE_MS, update_level)
+            after_id = root.after(LEVEL_UPDATE_MS, update_level)
+            pending_after_ids.append(after_id)
 
     root.protocol("WM_DELETE_WINDOW", cancel_recording)
 
@@ -581,23 +623,171 @@ def record_with_gui(
     audio_data = np.concatenate(chunks, axis=0)
     duration = len(audio_data) / SAMPLE_RATE
     log.info("Captured %.1fs of audio.", duration)
-    return audio_data
+    return audio_data, root
 
 
-def save_wav(audio_data: np.ndarray) -> str:
-    """Save audio to a temporary WAV file."""
-    file_id = uuid.uuid4().hex[:8]
-    wav_path = os.path.join(tempfile.gettempdir(), f"claude_voice_{file_id}.wav")
-    with wave.open(wav_path, "wb") as wf:
+def save_wav_to(audio_data: np.ndarray, path: str) -> None:
+    """Save audio data to a WAV file at the given path."""
+    with wave.open(path, "wb") as wf:
         wf.setnchannels(AUDIO_CHANNELS)
         wf.setsampwidth(AUDIO_SAMPLE_WIDTH)
         wf.setframerate(SAMPLE_RATE)
         wf.writeframes(audio_data.tobytes())
+
+
+def save_wav(audio_data: np.ndarray) -> str:
+    """Save audio to a temporary WAV file. Returns the path."""
+    file_id = uuid.uuid4().hex[:8]
+    wav_path = os.path.join(tempfile.gettempdir(), f"claude_voice_{file_id}.wav")
+    save_wav_to(audio_data, wav_path)
     return wav_path
 
 
-def transcribe(wav_path: str, *, model_size: str = DEFAULT_MODEL_SIZE) -> str:
-    """Transcribe WAV file using faster-whisper."""
+def transcribe_with_progress(
+    wav_path: str,
+    *,
+    root: tk.Tk,
+    model_size: str = DEFAULT_MODEL_SIZE,
+    audio_duration: float = 0.0,
+    transcribe_ratio: float | None = None,
+) -> str:
+    """Run transcription with a tkinter progress window.
+
+    Reuses an existing tk.Tk root (from record_with_gui) to avoid creating
+    a second Tcl interpreter, which causes Tcl_AsyncDelete crashes on
+    Windows. Clears the existing widgets and replaces them with progress UI.
+
+    The root is destroyed when transcription completes or fails.
+
+    Returns the transcript text.
+    """
+    # Clear recording widgets, reuse the same window
+    for widget in root.winfo_children():
+        widget.destroy()
+
+    frame = tk.Frame(root, padx=20, pady=15)
+    frame.pack()
+
+    status_label = tk.Label(
+        frame,
+        text="Transcribing...",
+        font=FONT_STATUS,
+        fg=COLOR_TRANSCRIBING,
+    )
+    status_label.pack(pady=(0, 5))
+
+    # Estimate row
+    est_frame = tk.Frame(frame)
+    est_frame.pack(pady=(0, 5))
+
+    elapsed_var = tk.StringVar(value="0:00")
+    est_var = tk.StringVar()
+    has_estimate = transcribe_ratio is not None and audio_duration > 0
+    if has_estimate and transcribe_ratio is not None:
+        est_total = int(audio_duration * transcribe_ratio)
+        est_m, est_s = divmod(est_total, 60)
+        est_var.set(f"~{est_m}:{est_s:02d}")
+
+    tk.Label(est_frame, text="Elapsed:", font=FONT_DETAIL, fg=COLOR_MUTED).grid(
+        row=0, column=0, sticky="w", padx=(0, 5)
+    )
+    tk.Label(est_frame, textvariable=elapsed_var, font=FONT_DETAIL).grid(
+        row=0, column=1, sticky="e"
+    )
+    if has_estimate:
+        tk.Label(est_frame, text="Est:", font=FONT_DETAIL, fg=COLOR_MUTED).grid(
+            row=0, column=2, sticky="w", padx=(10, 5)
+        )
+        tk.Label(
+            est_frame, textvariable=est_var, font=FONT_DETAIL, fg=COLOR_MUTED
+        ).grid(row=0, column=3, sticky="e")
+
+    # Progress bar
+    progress_canvas = tk.Canvas(
+        frame,
+        width=PROGRESS_BAR_WIDTH,
+        height=PROGRESS_BAR_HEIGHT,
+        bg=PROGRESS_BG_COLOR,
+        highlightthickness=0,
+    )
+    progress_canvas.pack(pady=(5, 10))
+    progress_bar = progress_canvas.create_rectangle(
+        0, 0, 0, PROGRESS_BAR_HEIGHT, fill=PROGRESS_COLOR, width=0
+    )
+
+    percent_var = tk.StringVar(value="0%")
+    tk.Label(frame, textvariable=percent_var, font=FONT_DETAIL, fg=COLOR_MUTED).pack()
+
+    # Shared state between threads
+    progress_fraction = [0.0]
+    transcription_result: list[str | None] = [None]
+    transcription_error: list[Exception | None] = [None]
+    transcription_done = threading.Event()
+    t_start = time.time()
+
+    def on_progress(fraction: float) -> None:
+        progress_fraction[0] = fraction
+
+    def run_transcription() -> None:
+        try:
+            result = transcribe(
+                wav_path,
+                model_size=model_size,
+                progress_callback=on_progress,
+            )
+            transcription_result[0] = result
+        except Exception as e:
+            transcription_error[0] = e
+        finally:
+            transcription_done.set()
+
+    def update_ui() -> None:
+        # Update elapsed time
+        elapsed = int(time.time() - t_start)
+        mins, secs = divmod(elapsed, 60)
+        elapsed_var.set(f"{mins}:{secs:02d}")
+
+        # Update progress bar
+        frac = progress_fraction[0]
+        bar_width = int(frac * PROGRESS_BAR_WIDTH)
+        progress_canvas.coords(progress_bar, 0, 0, bar_width, PROGRESS_BAR_HEIGHT)
+        percent_var.set(f"{int(frac * 100)}%")
+
+        if transcription_done.is_set():
+            root.destroy()
+        else:
+            root.after(PROGRESS_UPDATE_MS, update_ui)
+
+    # Prevent closing the window from killing transcription
+    root.protocol("WM_DELETE_WINDOW", lambda: None)
+
+    thread = threading.Thread(target=run_transcription, daemon=True)
+    thread.start()
+    update_ui()
+    root.mainloop()
+
+    thread.join(timeout=5)
+
+    if transcription_error[0] is not None:
+        raise transcription_error[0]
+
+    return transcription_result[0] or ""
+
+
+def transcribe(
+    wav_path: str,
+    *,
+    model_size: str = DEFAULT_MODEL_SIZE,
+    progress_callback: "Callable[[float], None] | None" = None,
+) -> str:
+    """Transcribe WAV file using faster-whisper.
+
+    Args:
+        wav_path: Path to the WAV file.
+        model_size: Whisper model size.
+        progress_callback: Called with progress fraction (0.0-1.0) after each
+            segment, based on segment end time / audio duration.
+    """
     log.info("Transcribing with model '%s'...", model_size)
     if _whisper_preload_started:
         _whisper_module_ready.wait()
@@ -606,6 +796,14 @@ def transcribe(wav_path: str, *, model_size: str = DEFAULT_MODEL_SIZE) -> str:
         from faster_whisper import WhisperModel as _WM
 
         model_cls = _WM
+
+    # Get audio duration for progress tracking
+    audio_duration = 0.0
+    try:
+        with wave.open(wav_path, "rb") as wf:
+            audio_duration = wf.getnframes() / wf.getframerate()
+    except Exception:
+        pass
 
     # Suppress stdout from ctranslate2/faster-whisper progress output
     devnull = open(os.devnull, "w")  # noqa: SIM115
@@ -616,7 +814,12 @@ def transcribe(wav_path: str, *, model_size: str = DEFAULT_MODEL_SIZE) -> str:
             model_size, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE
         )
         segments, _ = model.transcribe(wav_path, beam_size=WHISPER_BEAM_SIZE)
-        text_parts = [seg.text.strip() for seg in segments]
+        text_parts = []
+        for seg in segments:
+            text_parts.append(seg.text.strip())
+            if progress_callback and audio_duration > 0:
+                fraction = min(seg.end / audio_duration, 1.0)
+                progress_callback(fraction)
     except Exception as e:
         log.error(
             "Failed to load Whisper model '%s': %s\n"
@@ -629,6 +832,8 @@ def transcribe(wav_path: str, *, model_size: str = DEFAULT_MODEL_SIZE) -> str:
     finally:
         sys.stdout = saved_stdout
         devnull.close()
+    if progress_callback:
+        progress_callback(1.0)
     return " ".join(text_parts).strip()
 
 
@@ -653,6 +858,20 @@ def main() -> None:
         help="List available audio input devices and exit",
     )
     parser.add_argument(
+        "--wav-output",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Save recorded audio to this WAV file (kept after transcription)",
+    )
+    parser.add_argument(
+        "--wav-input",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Transcribe from an existing WAV file instead of recording",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging to stderr",
@@ -673,6 +892,29 @@ def main() -> None:
             log.info("  %d: %s", dev["id"], dev["name"])
         sys.exit(EXIT_SUCCESS)
 
+    # --wav-input: transcribe-only mode (no recording, no lock, no GUI)
+    if args.wav_input:
+        if not os.path.exists(args.wav_input):
+            log.error("WAV file not found: %s", args.wav_input)
+            sys.exit(EXIT_ERROR)
+        start_whisper_preload()
+        t_start = time.time()
+        transcript = transcribe(args.wav_input, model_size=args.model)
+        t_elapsed = time.time() - t_start
+        try:
+            with wave.open(args.wav_input, "rb") as wf:
+                audio_duration = wf.getnframes() / wf.getframerate()
+        except Exception:
+            audio_duration = 0.0
+        log.info(
+            "Transcribed %.1fs audio in %.1fs (model=%s)",
+            audio_duration,
+            t_elapsed,
+            args.model,
+        )
+        print(transcript)
+        sys.exit(EXIT_SUCCESS)
+
     try:
         _acquire_lock()
     except LockAcquireError as e:
@@ -684,8 +926,11 @@ def main() -> None:
         start_whisper_preload()
         cfg = Config()
         cwd = os.getcwd()
+        gui_root: tk.Tk | None = None
         try:
-            audio_data = record_with_gui(cwd, device_id=args.device, config=cfg)
+            audio_data, gui_root = record_with_gui(
+                cwd, device_id=args.device, config=cfg
+            )
         except RecordingCancelled:
             print("[CANCEL]")
             sys.exit(EXIT_SUCCESS)
@@ -699,10 +944,25 @@ def main() -> None:
             log.info("Estimated transcription time: %.0fs", est)
 
         wav_path = None
+        delete_wav = True
         try:
-            wav_path = save_wav(audio_data)
+            if args.wav_output:
+                wav_path = os.path.abspath(args.wav_output)
+                save_wav_to(audio_data, wav_path)
+                log.info("Saved audio to %s", wav_path)
+                delete_wav = False
+            else:
+                wav_path = save_wav(audio_data)
+
             t_start = time.time()
-            transcript = transcribe(wav_path, model_size=args.model)
+            transcript = transcribe_with_progress(
+                wav_path,
+                root=gui_root,
+                model_size=args.model,
+                audio_duration=audio_duration,
+                transcribe_ratio=cfg.transcribe_ratio,
+            )
+            gui_root = None  # transcribe_with_progress destroyed it
             t_elapsed = time.time() - t_start
             if audio_duration > 0:
                 new_ratio = t_elapsed / audio_duration
@@ -715,8 +975,13 @@ def main() -> None:
                     new_ratio,
                 )
         finally:
-            if wav_path and os.path.exists(wav_path):
+            if delete_wav and wav_path and os.path.exists(wav_path):
                 os.remove(wav_path)
+            if gui_root is not None:
+                try:
+                    gui_root.destroy()
+                except Exception:
+                    pass
 
         if not transcript:
             print("[DONE]")

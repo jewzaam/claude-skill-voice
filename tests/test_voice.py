@@ -342,7 +342,7 @@ class TestTranscribe:
         with patch("faster_whisper.WhisperModel", return_value=mock_model) as mock_cls:
             voice.transcribe("/tmp/test.wav")
 
-        mock_cls.assert_called_once_with("base", device="cpu", compute_type="int8")
+        mock_cls.assert_called_once_with("small", device="cpu", compute_type="int8")
 
 
 class TestRecordingError:
@@ -570,7 +570,7 @@ class TestRecordWithGui:
         call_kwargs = mock_cls.call_args[1]
         assert call_kwargs["device"] == 5
 
-    def test_successful_recording_returns_audio(self):
+    def test_successful_recording_returns_audio_and_root(self):
         mock_stream = MagicMock()
         tk_mocks = _mock_tk()
 
@@ -597,10 +597,11 @@ class TestRecordWithGui:
             tk_mocks["frame"],
             tk_mocks["button"],
         ):
-            result = voice.record_with_gui("/tmp", device_id=0)
+            audio_data, root = voice.record_with_gui("/tmp", device_id=0)
 
-        assert isinstance(result, np.ndarray)
-        assert len(result) == 1600
+        assert isinstance(audio_data, np.ndarray)
+        assert len(audio_data) == 1600
+        assert root is tk_mocks["root"]
 
     def test_audio_callback_skips_when_paused(self):
         mock_stream = MagicMock()
@@ -629,9 +630,9 @@ class TestRecordWithGui:
             tk_mocks["frame"],
             tk_mocks["button"],
         ):
-            result = voice.record_with_gui("/tmp", device_id=0)
+            audio_data, _root = voice.record_with_gui("/tmp", device_id=0)
 
-        assert len(result) == 1600
+        assert len(audio_data) == 1600
 
 
 class TestTranscribeErrorHandling:
@@ -659,6 +660,12 @@ def _no_lock():
         yield
 
 
+def _mock_record_return(audio: np.ndarray) -> tuple[np.ndarray, MagicMock]:
+    """Create a (audio_data, mock_root) tuple for mocking record_with_gui."""
+    mock_root = MagicMock()
+    return (audio, mock_root)
+
+
 @pytest.mark.usefixtures("_no_lock")
 class TestMain:
     def test_empty_transcript_prints_done_only(self, capsys):
@@ -666,8 +673,11 @@ class TestMain:
 
         with (
             patch("sys.argv", ["voice.py"]),
-            patch("voice.record_with_gui", return_value=mock_audio),
-            patch("voice.transcribe", return_value=""),
+            patch(
+                "voice.record_with_gui",
+                return_value=_mock_record_return(mock_audio),
+            ),
+            patch("voice.transcribe_with_progress", return_value=""),
             patch("voice.save_wav", return_value="/tmp/fake.wav"),
             patch("voice.os.path.exists", return_value=True),
             patch("voice.os.remove"),
@@ -711,8 +721,11 @@ class TestMain:
 
         with (
             patch("sys.argv", ["voice.py"]),
-            patch("voice.record_with_gui", return_value=mock_audio),
-            patch("voice.transcribe", return_value="hello world"),
+            patch(
+                "voice.record_with_gui",
+                return_value=_mock_record_return(mock_audio),
+            ),
+            patch("voice.transcribe_with_progress", return_value="hello world"),
             patch("voice.save_wav", return_value="/tmp/fake.wav"),
             patch("voice.os.path.exists", return_value=True),
             patch("voice.os.remove"),
@@ -729,8 +742,14 @@ class TestMain:
 
         with (
             patch("sys.argv", ["voice.py"]),
-            patch("voice.record_with_gui", return_value=mock_audio),
-            patch("voice.transcribe", side_effect=RuntimeError("model error")),
+            patch(
+                "voice.record_with_gui",
+                return_value=_mock_record_return(mock_audio),
+            ),
+            patch(
+                "voice.transcribe_with_progress",
+                side_effect=RuntimeError("model error"),
+            ),
             patch("voice.save_wav", return_value="/tmp/fake.wav"),
             patch("voice.os.path.exists", return_value=True) as mock_exists,
             patch("voice.os.remove") as mock_remove,
@@ -746,7 +765,10 @@ class TestMain:
 
         with (
             patch("sys.argv", ["voice.py"]),
-            patch("voice.record_with_gui", return_value=mock_audio),
+            patch(
+                "voice.record_with_gui",
+                return_value=_mock_record_return(mock_audio),
+            ),
             patch("voice.save_wav", side_effect=OSError("disk full")),
             patch("voice.os.remove") as mock_remove,
         ):
@@ -782,23 +804,79 @@ class TestMain:
 
         with (
             patch("sys.argv", ["voice.py", "--model", "tiny"]),
-            patch("voice.record_with_gui", return_value=mock_audio),
-            patch("voice.transcribe", return_value="hello") as mock_transcribe,
+            patch(
+                "voice.record_with_gui",
+                return_value=_mock_record_return(mock_audio),
+            ),
+            patch(
+                "voice.transcribe_with_progress", return_value="hello"
+            ) as mock_transcribe,
             patch("voice.save_wav", return_value="/tmp/fake.wav"),
             patch("voice.os.path.exists", return_value=True),
             patch("voice.os.remove"),
         ):
             voice.main()
 
-        mock_transcribe.assert_called_once_with("/tmp/fake.wav", model_size="tiny")
+        mock_transcribe.assert_called_once()
+        args, kwargs = mock_transcribe.call_args
+        assert args[0] == "/tmp/fake.wav"
+        assert kwargs["model_size"] == "tiny"
+
+    def test_root_passed_to_transcribe_with_progress(self):
+        mock_audio = np.zeros(16000, dtype=np.int16)
+        mock_root = MagicMock()
+
+        with (
+            patch("sys.argv", ["voice.py"]),
+            patch(
+                "voice.record_with_gui",
+                return_value=(mock_audio, mock_root),
+            ),
+            patch(
+                "voice.transcribe_with_progress", return_value="hello"
+            ) as mock_transcribe,
+            patch("voice.save_wav", return_value="/tmp/fake.wav"),
+            patch("voice.os.path.exists", return_value=True),
+            patch("voice.os.remove"),
+        ):
+            voice.main()
+
+        kwargs = mock_transcribe.call_args[1]
+        assert kwargs["root"] is mock_root
+
+    def test_root_destroyed_on_transcription_failure(self):
+        mock_audio = np.zeros(16000, dtype=np.int16)
+        mock_root = MagicMock()
+
+        with (
+            patch("sys.argv", ["voice.py"]),
+            patch(
+                "voice.record_with_gui",
+                return_value=(mock_audio, mock_root),
+            ),
+            patch(
+                "voice.transcribe_with_progress",
+                side_effect=RuntimeError("model error"),
+            ),
+            patch("voice.save_wav", return_value="/tmp/fake.wav"),
+            patch("voice.os.path.exists", return_value=True),
+            patch("voice.os.remove"),
+        ):
+            with pytest.raises(RuntimeError, match="model error"):
+                voice.main()
+
+        mock_root.destroy.assert_called_once()
 
     def test_device_flag_passed_to_record(self):
         mock_audio = np.zeros(16000, dtype=np.int16)
 
         with (
             patch("sys.argv", ["voice.py", "--device", "5"]),
-            patch("voice.record_with_gui", return_value=mock_audio) as mock_record,
-            patch("voice.transcribe", return_value="hello"),
+            patch(
+                "voice.record_with_gui",
+                return_value=_mock_record_return(mock_audio),
+            ) as mock_record,
+            patch("voice.transcribe_with_progress", return_value="hello"),
             patch("voice.save_wav", return_value="/tmp/fake.wav"),
             patch("voice.os.path.exists", return_value=True),
             patch("voice.os.remove"),
@@ -809,3 +887,376 @@ class TestMain:
         args, kwargs = mock_record.call_args
         assert args[0] == os.getcwd()
         assert kwargs["device_id"] == 5
+
+
+@pytest.fixture(autouse=False)
+def _reset_whisper_globals():
+    """Reset whisper preload globals so tests use the patched WhisperModel."""
+    with (
+        patch.object(voice, "_whisper_preload_started", False),
+        patch.object(voice, "_WhisperModel", None),
+    ):
+        yield
+
+
+@pytest.mark.usefixtures("_reset_whisper_globals")
+class TestTranscribeProgressCallback:
+    """Tests for transcribe() progress_callback parameter."""
+
+    def _make_segments(self, timestamps):
+        """Create mock segments with given (end,) timestamps."""
+        segments = []
+        for end_time in timestamps:
+            seg = MagicMock()
+            seg.text = "word"
+            seg.end = end_time
+            segments.append(seg)
+        return segments
+
+    def test_callback_called_with_correct_fractions(self, tmp_path):
+        wav_path = str(tmp_path / "test.wav")
+        # Create a 10-second WAV file
+        with wave.open(wav_path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(np.zeros(160000, dtype=np.int16).tobytes())
+
+        segments = self._make_segments([2.5, 5.0, 10.0])
+        mock_model = MagicMock()
+        mock_model.transcribe.return_value = (segments, None)
+
+        fractions = []
+
+        with patch("faster_whisper.WhisperModel", return_value=mock_model):
+            voice.transcribe(wav_path, progress_callback=fractions.append)
+
+        # Last segment hits 1.0 (10/10), plus explicit final 1.0 call
+        assert fractions == [0.25, 0.5, 1.0, 1.0]
+
+    def test_callback_clamped_to_1(self, tmp_path):
+        wav_path = str(tmp_path / "test.wav")
+        with wave.open(wav_path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(np.zeros(80000, dtype=np.int16).tobytes())
+
+        # Segment end time exceeds audio duration
+        segments = self._make_segments([7.0])
+        mock_model = MagicMock()
+        mock_model.transcribe.return_value = (segments, None)
+
+        fractions = []
+
+        with patch("faster_whisper.WhisperModel", return_value=mock_model):
+            voice.transcribe(wav_path, progress_callback=fractions.append)
+
+        assert fractions[0] == 1.0
+
+    def test_final_1_0_always_sent(self, tmp_path):
+        wav_path = str(tmp_path / "test.wav")
+        with wave.open(wav_path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(np.zeros(80000, dtype=np.int16).tobytes())
+
+        segments = self._make_segments([2.5])
+        mock_model = MagicMock()
+        mock_model.transcribe.return_value = (segments, None)
+
+        fractions = []
+
+        with patch("faster_whisper.WhisperModel", return_value=mock_model):
+            voice.transcribe(wav_path, progress_callback=fractions.append)
+
+        assert fractions[-1] == 1.0
+
+    def test_no_callback_is_safe(self, tmp_path):
+        wav_path = str(tmp_path / "test.wav")
+        with wave.open(wav_path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(np.zeros(16000, dtype=np.int16).tobytes())
+
+        segments = self._make_segments([1.0])
+        mock_model = MagicMock()
+        mock_model.transcribe.return_value = (segments, None)
+
+        with patch("faster_whisper.WhisperModel", return_value=mock_model):
+            result = voice.transcribe(wav_path)
+
+        assert result == "word"
+
+    def test_callback_not_called_when_wav_unreadable(self, tmp_path):
+        # Use a path that doesn't exist — wave.open will fail,
+        # audio_duration stays 0, so per-segment callbacks are skipped.
+        wav_path = str(tmp_path / "nonexistent.wav")
+        segments = self._make_segments([1.0])
+        mock_model = MagicMock()
+        mock_model.transcribe.return_value = (segments, None)
+
+        fractions = []
+
+        with patch("faster_whisper.WhisperModel", return_value=mock_model):
+            voice.transcribe(wav_path, progress_callback=fractions.append)
+
+        # Only the final 1.0 is sent (no per-segment callbacks).
+        assert fractions == [1.0]
+
+    def test_empty_segments_still_sends_final(self, tmp_path):
+        wav_path = str(tmp_path / "test.wav")
+        with wave.open(wav_path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(np.zeros(16000, dtype=np.int16).tobytes())
+
+        mock_model = MagicMock()
+        mock_model.transcribe.return_value = ([], None)
+
+        fractions = []
+
+        with patch("faster_whisper.WhisperModel", return_value=mock_model):
+            voice.transcribe(wav_path, progress_callback=fractions.append)
+
+        assert fractions == [1.0]
+
+
+class TestTranscribeWithProgress:
+    """Tests for transcribe_with_progress() which reuses a tk.Tk root.
+
+    These tests mock tkinter widgets and voice.transcribe but let real
+    threading run. The mock mainloop returns immediately; the background
+    thread completes near-instantly with a mocked transcribe.
+    """
+
+    def _make_root(self, children=None):
+        mock_root = MagicMock()
+        mock_root.winfo_children.return_value = children or []
+        mock_root.mainloop.return_value = None
+        return mock_root
+
+    def _call(
+        self, mock_root, transcribe_return="", transcribe_side_effect=None, **kwargs
+    ):
+        with (
+            patch("voice.tk.Frame", return_value=MagicMock()),
+            patch("voice.tk.Label", return_value=MagicMock()),
+            patch("voice.tk.StringVar", return_value=MagicMock()),
+            patch("voice.tk.Canvas", return_value=MagicMock()),
+            patch(
+                "voice.transcribe",
+                return_value=transcribe_return,
+                side_effect=transcribe_side_effect,
+            ) as mock_transcribe,
+        ):
+            result = voice.transcribe_with_progress(
+                "/tmp/test.wav", root=mock_root, **kwargs
+            )
+            return result, mock_transcribe
+
+    def test_clears_existing_widgets(self):
+        child1, child2 = MagicMock(), MagicMock()
+        mock_root = self._make_root(children=[child1, child2])
+
+        result, _ = self._call(mock_root, transcribe_return="hello")
+
+        child1.destroy.assert_called_once()
+        child2.destroy.assert_called_once()
+        assert result == "hello"
+
+    def test_destroys_root_when_done(self):
+        mock_root = self._make_root()
+        self._call(mock_root, transcribe_return="result")
+        mock_root.destroy.assert_called()
+
+    def test_raises_transcription_error(self):
+        mock_root = self._make_root()
+
+        with pytest.raises(RuntimeError, match="model load failed"):
+            self._call(
+                mock_root,
+                transcribe_side_effect=RuntimeError("model load failed"),
+            )
+
+    def test_passes_model_size_to_transcribe(self):
+        mock_root = self._make_root()
+        _, mock_transcribe = self._call(
+            mock_root, transcribe_return="hi", model_size="tiny"
+        )
+        mock_transcribe.assert_called_once()
+        assert mock_transcribe.call_args[1]["model_size"] == "tiny"
+
+    def test_returns_empty_string_on_none_result(self):
+        mock_root = self._make_root()
+        result, _ = self._call(mock_root, transcribe_return="")
+        assert result == ""
+
+    def test_disables_window_close(self):
+        mock_root = self._make_root()
+        self._call(mock_root, transcribe_return="hi")
+
+        protocol_calls = [
+            c
+            for c in mock_root.protocol.call_args_list
+            if c[0][0] == "WM_DELETE_WINDOW"
+        ]
+        assert len(protocol_calls) == 1
+
+
+@pytest.mark.usefixtures("_no_lock", "_reset_whisper_globals")
+class TestWavInputOutput:
+    """Tests for --wav-input and --wav-output flags."""
+
+    def _make_wav(self, path, duration_seconds=1.0):
+        """Create a valid WAV file at the given path."""
+        n_samples = int(voice.SAMPLE_RATE * duration_seconds)
+        audio = np.zeros(n_samples, dtype=np.int16)
+        with wave.open(str(path), "wb") as wf:
+            wf.setnchannels(voice.AUDIO_CHANNELS)
+            wf.setsampwidth(voice.AUDIO_SAMPLE_WIDTH)
+            wf.setframerate(voice.SAMPLE_RATE)
+            wf.writeframes(audio.tobytes())
+
+    def test_wav_input_transcribes_existing_file(self, tmp_path, capsys):
+        wav_file = str(tmp_path / "test.wav")
+        self._make_wav(wav_file)
+
+        mock_model = MagicMock()
+        mock_seg = MagicMock()
+        mock_seg.text = "hello from file"
+        mock_seg.end = 1.0
+        mock_model.transcribe.return_value = ([mock_seg], None)
+
+        with (
+            patch("sys.argv", ["voice.py", "--wav-input", wav_file]),
+            patch("faster_whisper.WhisperModel", return_value=mock_model),
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                voice.main()
+            assert exc_info.value.code == voice.EXIT_SUCCESS
+
+        captured = capsys.readouterr()
+        assert "hello from file" in captured.out
+
+    def test_wav_input_with_model_flag(self, tmp_path, capsys):
+        wav_file = str(tmp_path / "test.wav")
+        self._make_wav(wav_file)
+
+        mock_model = MagicMock()
+        mock_model.transcribe.return_value = ([], None)
+
+        with (
+            patch(
+                "sys.argv",
+                ["voice.py", "--wav-input", wav_file, "--model", "tiny"],
+            ),
+            patch("faster_whisper.WhisperModel", return_value=mock_model) as mock_cls,
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                voice.main()
+            assert exc_info.value.code == voice.EXIT_SUCCESS
+
+        mock_cls.assert_called_once_with("tiny", device="cpu", compute_type="int8")
+
+    def test_wav_input_missing_file_exits_error(self):
+        with patch(
+            "sys.argv",
+            ["voice.py", "--wav-input", "/nonexistent/file.wav"],
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                voice.main()
+            assert exc_info.value.code == voice.EXIT_ERROR
+
+    def test_wav_input_no_status_line(self, tmp_path, capsys):
+        """--wav-input output has no [DONE]/[CANCEL] status line."""
+        wav_file = str(tmp_path / "test.wav")
+        self._make_wav(wav_file)
+
+        mock_model = MagicMock()
+        mock_seg = MagicMock()
+        mock_seg.text = "test"
+        mock_seg.end = 1.0
+        mock_model.transcribe.return_value = ([mock_seg], None)
+
+        with (
+            patch("sys.argv", ["voice.py", "--wav-input", wav_file]),
+            patch("faster_whisper.WhisperModel", return_value=mock_model),
+        ):
+            with pytest.raises(SystemExit):
+                voice.main()
+
+        captured = capsys.readouterr()
+        assert "[DONE]" not in captured.out
+        assert "[CANCEL]" not in captured.out
+
+    def test_wav_input_skips_lock(self, tmp_path):
+        """--wav-input should not acquire the recording lock."""
+        wav_file = str(tmp_path / "test.wav")
+        self._make_wav(wav_file)
+
+        mock_model = MagicMock()
+        mock_model.transcribe.return_value = ([], None)
+
+        with (
+            patch("sys.argv", ["voice.py", "--wav-input", wav_file]),
+            patch("faster_whisper.WhisperModel", return_value=mock_model),
+            patch("voice._acquire_lock") as mock_lock,
+        ):
+            with pytest.raises(SystemExit):
+                voice.main()
+
+        mock_lock.assert_not_called()
+
+    def test_wav_output_writes_to_path(self, tmp_path):
+        mock_audio = np.zeros(16000, dtype=np.int16)
+        mock_root = MagicMock()
+        output_path = str(tmp_path / "saved.wav")
+
+        with (
+            patch(
+                "sys.argv",
+                ["voice.py", "--wav-output", output_path],
+            ),
+            patch(
+                "voice.record_with_gui",
+                return_value=(mock_audio, mock_root),
+            ),
+            patch("voice.transcribe_with_progress", return_value="hello"),
+            patch("voice.save_wav_to") as mock_save,
+            patch("voice.os.remove") as mock_remove,
+        ):
+            voice.main()
+
+        # Writes directly to the output path
+        mock_save.assert_called_once()
+        assert mock_save.call_args[0][1] == os.path.abspath(output_path)
+        # Does not delete the user's file
+        mock_remove.assert_not_called()
+
+    def test_wav_output_still_transcribes(self, tmp_path, capsys):
+        mock_audio = np.zeros(16000, dtype=np.int16)
+        mock_root = MagicMock()
+        output_path = str(tmp_path / "saved.wav")
+
+        with (
+            patch(
+                "sys.argv",
+                ["voice.py", "--wav-output", output_path],
+            ),
+            patch(
+                "voice.record_with_gui",
+                return_value=(mock_audio, mock_root),
+            ),
+            patch("voice.transcribe_with_progress", return_value="hello world"),
+            patch("voice.save_wav_to"),
+        ):
+            voice.main()
+
+        captured = capsys.readouterr()
+        lines = captured.out.strip().split("\n")
+        assert lines[0] == "[DONE]"
+        assert lines[1] == "hello world"
