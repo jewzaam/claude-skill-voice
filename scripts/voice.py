@@ -36,41 +36,19 @@ except ModuleNotFoundError:
     sys.exit(1)
 
 import threading
-from typing import Callable
 
 import numpy as np
 import sounddevice as sd
 
+from whisper import AUDIO_CHANNELS  # noqa: F401
+from whisper import AUDIO_SAMPLE_WIDTH  # noqa: F401
+from whisper import DEFAULT_MODEL_SIZE  # noqa: F401
+from whisper import SAMPLE_RATE  # noqa: F401
+from whisper import start_whisper_preload  # noqa: F401
+from whisper import transcribe_audio  # noqa: F401
+from whisper import transcribe_wav
+
 log = logging.getLogger(__name__)
-
-# Background import of faster-whisper (heavy C++ bindings).
-# Started early so the import finishes during recording.
-_whisper_preload_started = False
-_whisper_module_ready = threading.Event()
-_WhisperModel = None
-
-
-def _preload_whisper() -> None:
-    """Import faster-whisper in a background thread."""
-    global _WhisperModel
-    try:
-        from faster_whisper import WhisperModel
-
-        _WhisperModel = WhisperModel
-    except Exception:
-        pass  # transcribe() will re-attempt and surface the error
-    finally:
-        _whisper_module_ready.set()
-
-
-def start_whisper_preload() -> None:
-    """Kick off the background import. Safe to call multiple times."""
-    global _whisper_preload_started
-    if _whisper_preload_started:
-        return
-    _whisper_preload_started = True
-    t = threading.Thread(target=_preload_whisper, daemon=True)
-    t.start()
 
 
 APP_NAME = "claude-skill-voice"
@@ -80,14 +58,7 @@ CONFIG_KEY_WINDOW_X = "window_x"
 CONFIG_KEY_WINDOW_Y = "window_y"
 CONFIG_KEY_TRANSCRIBE_RATIO = "transcribe_ratio"
 
-SAMPLE_RATE = 16000
-AUDIO_CHANNELS = 1
 AUDIO_DTYPE = "int16"
-AUDIO_SAMPLE_WIDTH = 2
-DEFAULT_MODEL_SIZE = "small"
-WHISPER_BEAM_SIZE = 5
-WHISPER_DEVICE = "cpu"
-WHISPER_COMPUTE_TYPE = "int8"
 
 EXIT_SUCCESS = 0
 EXIT_ERROR = 1
@@ -730,7 +701,7 @@ def transcribe_with_progress(
 
     def run_transcription() -> None:
         try:
-            result = transcribe(
+            result = transcribe_wav(
                 wav_path,
                 model_size=model_size,
                 progress_callback=on_progress,
@@ -772,69 +743,6 @@ def transcribe_with_progress(
         raise transcription_error[0]
 
     return transcription_result[0] or ""
-
-
-def transcribe(
-    wav_path: str,
-    *,
-    model_size: str = DEFAULT_MODEL_SIZE,
-    progress_callback: "Callable[[float], None] | None" = None,
-) -> str:
-    """Transcribe WAV file using faster-whisper.
-
-    Args:
-        wav_path: Path to the WAV file.
-        model_size: Whisper model size.
-        progress_callback: Called with progress fraction (0.0-1.0) after each
-            segment, based on segment end time / audio duration.
-    """
-    log.info("Transcribing with model '%s'...", model_size)
-    if _whisper_preload_started:
-        _whisper_module_ready.wait()
-    model_cls = _WhisperModel if _whisper_preload_started and _WhisperModel else None
-    if model_cls is None:
-        from faster_whisper import WhisperModel as _WM
-
-        model_cls = _WM
-
-    # Get audio duration for progress tracking
-    audio_duration = 0.0
-    try:
-        with wave.open(wav_path, "rb") as wf:
-            audio_duration = wf.getnframes() / wf.getframerate()
-    except Exception:
-        pass
-
-    # Suppress stdout from ctranslate2/faster-whisper progress output
-    devnull = open(os.devnull, "w")  # noqa: SIM115
-    saved_stdout = sys.stdout
-    sys.stdout = devnull
-    try:
-        model = model_cls(
-            model_size, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE
-        )
-        segments, _ = model.transcribe(wav_path, beam_size=WHISPER_BEAM_SIZE)
-        text_parts = []
-        for seg in segments:
-            text_parts.append(seg.text.strip())
-            if progress_callback and audio_duration > 0:
-                fraction = min(seg.end / audio_duration, 1.0)
-                progress_callback(fraction)
-    except Exception as e:
-        log.error(
-            "Failed to load Whisper model '%s': %s\n"
-            "Ensure faster-whisper is installed and you have internet "
-            "connectivity for initial model download.",
-            model_size,
-            e,
-        )
-        raise
-    finally:
-        sys.stdout = saved_stdout
-        devnull.close()
-    if progress_callback:
-        progress_callback(1.0)
-    return " ".join(text_parts).strip()
 
 
 def main() -> None:
@@ -899,7 +807,7 @@ def main() -> None:
             sys.exit(EXIT_ERROR)
         start_whisper_preload()
         t_start = time.time()
-        transcript = transcribe(args.wav_input, model_size=args.model)
+        transcript = transcribe_wav(args.wav_input, model_size=args.model)
         t_elapsed = time.time() - t_start
         try:
             with wave.open(args.wav_input, "rb") as wf:

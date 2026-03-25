@@ -15,6 +15,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
 import voice  # noqa: E402
+import whisper as whisper_mod  # noqa: E402
 
 
 class TestHomeRelativePath:
@@ -300,10 +301,9 @@ class TestTranscribe:
         mock_model = MagicMock()
         mock_model.transcribe.return_value = ([mock_segment1, mock_segment2], None)
 
-        with patch("faster_whisper.WhisperModel", return_value=mock_model) as mock_cls:
-            result = voice.transcribe("/tmp/test.wav", model_size="tiny")
+        with patch("whisper._get_or_create_model", return_value=mock_model):
+            result = whisper_mod.transcribe_wav("/tmp/test.wav", model_size="tiny")
 
-        mock_cls.assert_called_once_with("tiny", device="cpu", compute_type="int8")
         mock_model.transcribe.assert_called_once_with("/tmp/test.wav", beam_size=5)
         assert result == "Hello world how are you"
 
@@ -311,8 +311,8 @@ class TestTranscribe:
         mock_model = MagicMock()
         mock_model.transcribe.return_value = ([], None)
 
-        with patch("faster_whisper.WhisperModel", return_value=mock_model):
-            result = voice.transcribe("/tmp/test.wav")
+        with patch("whisper._get_or_create_model", return_value=mock_model):
+            result = whisper_mod.transcribe_wav("/tmp/test.wav")
 
         assert result == ""
 
@@ -323,26 +323,27 @@ class TestTranscribe:
         mock_model = MagicMock()
         mock_model.transcribe.return_value = ([mock_segment], None)
 
-        with patch("faster_whisper.WhisperModel", return_value=mock_model):
-            result = voice.transcribe("/tmp/test.wav")
+        with patch("whisper._get_or_create_model", return_value=mock_model):
+            result = whisper_mod.transcribe_wav("/tmp/test.wav")
 
         assert result == ""
 
     def test_model_load_failure(self):
         with patch(
-            "faster_whisper.WhisperModel", side_effect=RuntimeError("download failed")
+            "whisper._get_or_create_model",
+            side_effect=RuntimeError("download failed"),
         ):
             with pytest.raises(RuntimeError, match="download failed"):
-                voice.transcribe("/tmp/test.wav")
+                whisper_mod.transcribe_wav("/tmp/test.wav")
 
     def test_default_model_size(self):
         mock_model = MagicMock()
         mock_model.transcribe.return_value = ([], None)
 
-        with patch("faster_whisper.WhisperModel", return_value=mock_model) as mock_cls:
-            voice.transcribe("/tmp/test.wav")
+        with patch("whisper._get_or_create_model", return_value=mock_model) as mock_get:
+            whisper_mod.transcribe_wav("/tmp/test.wav")
 
-        mock_cls.assert_called_once_with("small", device="cpu", compute_type="int8")
+        mock_get.assert_called_once_with("small")
 
 
 class TestRecordingError:
@@ -639,13 +640,13 @@ class TestTranscribeErrorHandling:
     def test_model_load_logs_helpful_message(self):
         with (
             patch(
-                "faster_whisper.WhisperModel",
+                "whisper._get_or_create_model",
                 side_effect=RuntimeError("connection refused"),
             ),
-            patch("voice.log") as mock_log,
+            patch("whisper.log") as mock_log,
         ):
             with pytest.raises(RuntimeError):
-                voice.transcribe("/tmp/test.wav", model_size="small")
+                whisper_mod.transcribe_wav("/tmp/test.wav", model_size="small")
 
         mock_log.error.assert_called_once()
         msg = mock_log.error.call_args[0][0] % mock_log.error.call_args[0][1:]
@@ -891,10 +892,12 @@ class TestMain:
 
 @pytest.fixture(autouse=False)
 def _reset_whisper_globals():
-    """Reset whisper preload globals so tests use the patched WhisperModel."""
+    """Reset whisper module globals so tests use the patched WhisperModel."""
     with (
-        patch.object(voice, "_whisper_preload_started", False),
-        patch.object(voice, "_WhisperModel", None),
+        patch.object(whisper_mod, "_whisper_preload_started", False),
+        patch.object(whisper_mod, "_WhisperModel", None),
+        patch.object(whisper_mod, "_cached_model", None),
+        patch.object(whisper_mod, "_cached_model_size", None),
     ):
         yield
 
@@ -928,8 +931,8 @@ class TestTranscribeProgressCallback:
 
         fractions = []
 
-        with patch("faster_whisper.WhisperModel", return_value=mock_model):
-            voice.transcribe(wav_path, progress_callback=fractions.append)
+        with patch("whisper._get_or_create_model", return_value=mock_model):
+            whisper_mod.transcribe_wav(wav_path, progress_callback=fractions.append)
 
         # Last segment hits 1.0 (10/10), plus explicit final 1.0 call
         assert fractions == [0.25, 0.5, 1.0, 1.0]
@@ -949,8 +952,8 @@ class TestTranscribeProgressCallback:
 
         fractions = []
 
-        with patch("faster_whisper.WhisperModel", return_value=mock_model):
-            voice.transcribe(wav_path, progress_callback=fractions.append)
+        with patch("whisper._get_or_create_model", return_value=mock_model):
+            whisper_mod.transcribe_wav(wav_path, progress_callback=fractions.append)
 
         assert fractions[0] == 1.0
 
@@ -968,8 +971,8 @@ class TestTranscribeProgressCallback:
 
         fractions = []
 
-        with patch("faster_whisper.WhisperModel", return_value=mock_model):
-            voice.transcribe(wav_path, progress_callback=fractions.append)
+        with patch("whisper._get_or_create_model", return_value=mock_model):
+            whisper_mod.transcribe_wav(wav_path, progress_callback=fractions.append)
 
         assert fractions[-1] == 1.0
 
@@ -985,8 +988,8 @@ class TestTranscribeProgressCallback:
         mock_model = MagicMock()
         mock_model.transcribe.return_value = (segments, None)
 
-        with patch("faster_whisper.WhisperModel", return_value=mock_model):
-            result = voice.transcribe(wav_path)
+        with patch("whisper._get_or_create_model", return_value=mock_model):
+            result = whisper_mod.transcribe_wav(wav_path)
 
         assert result == "word"
 
@@ -1000,8 +1003,8 @@ class TestTranscribeProgressCallback:
 
         fractions = []
 
-        with patch("faster_whisper.WhisperModel", return_value=mock_model):
-            voice.transcribe(wav_path, progress_callback=fractions.append)
+        with patch("whisper._get_or_create_model", return_value=mock_model):
+            whisper_mod.transcribe_wav(wav_path, progress_callback=fractions.append)
 
         # Only the final 1.0 is sent (no per-segment callbacks).
         assert fractions == [1.0]
@@ -1019,8 +1022,8 @@ class TestTranscribeProgressCallback:
 
         fractions = []
 
-        with patch("faster_whisper.WhisperModel", return_value=mock_model):
-            voice.transcribe(wav_path, progress_callback=fractions.append)
+        with patch("whisper._get_or_create_model", return_value=mock_model):
+            whisper_mod.transcribe_wav(wav_path, progress_callback=fractions.append)
 
         assert fractions == [1.0]
 
@@ -1028,7 +1031,7 @@ class TestTranscribeProgressCallback:
 class TestTranscribeWithProgress:
     """Tests for transcribe_with_progress() which reuses a tk.Tk root.
 
-    These tests mock tkinter widgets and voice.transcribe but let real
+    These tests mock tkinter widgets and whisper.transcribe_wav but let real
     threading run. The mock mainloop returns immediately; the background
     thread completes near-instantly with a mocked transcribe.
     """
@@ -1048,7 +1051,7 @@ class TestTranscribeWithProgress:
             patch("voice.tk.StringVar", return_value=MagicMock()),
             patch("voice.tk.Canvas", return_value=MagicMock()),
             patch(
-                "voice.transcribe",
+                "voice.transcribe_wav",
                 return_value=transcribe_return,
                 side_effect=transcribe_side_effect,
             ) as mock_transcribe,
@@ -1133,7 +1136,7 @@ class TestWavInputOutput:
 
         with (
             patch("sys.argv", ["voice.py", "--wav-input", wav_file]),
-            patch("faster_whisper.WhisperModel", return_value=mock_model),
+            patch("whisper._get_or_create_model", return_value=mock_model),
         ):
             with pytest.raises(SystemExit) as exc_info:
                 voice.main()
@@ -1154,13 +1157,13 @@ class TestWavInputOutput:
                 "sys.argv",
                 ["voice.py", "--wav-input", wav_file, "--model", "tiny"],
             ),
-            patch("faster_whisper.WhisperModel", return_value=mock_model) as mock_cls,
+            patch("whisper._get_or_create_model", return_value=mock_model) as mock_get,
         ):
             with pytest.raises(SystemExit) as exc_info:
                 voice.main()
             assert exc_info.value.code == voice.EXIT_SUCCESS
 
-        mock_cls.assert_called_once_with("tiny", device="cpu", compute_type="int8")
+        mock_get.assert_called_once_with("tiny")
 
     def test_wav_input_missing_file_exits_error(self):
         with patch(
@@ -1184,7 +1187,7 @@ class TestWavInputOutput:
 
         with (
             patch("sys.argv", ["voice.py", "--wav-input", wav_file]),
-            patch("faster_whisper.WhisperModel", return_value=mock_model),
+            patch("whisper._get_or_create_model", return_value=mock_model),
         ):
             with pytest.raises(SystemExit):
                 voice.main()
@@ -1203,7 +1206,7 @@ class TestWavInputOutput:
 
         with (
             patch("sys.argv", ["voice.py", "--wav-input", wav_file]),
-            patch("faster_whisper.WhisperModel", return_value=mock_model),
+            patch("whisper._get_or_create_model", return_value=mock_model),
             patch("voice._acquire_lock") as mock_lock,
         ):
             with pytest.raises(SystemExit):
