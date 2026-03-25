@@ -7,6 +7,13 @@ ChunkManager coordinates background transcription of audio chunks.
 
 import logging
 import math
+import queue
+import threading
+from typing import Callable
+
+import numpy as np
+
+from whisper import transcribe_audio
 
 log = logging.getLogger(__name__)
 
@@ -81,3 +88,107 @@ class SilenceDetector:
         self._consecutive_silent = 0
         self._silence_onset_idx = None
         self._triggered = False
+
+
+class ChunkManager:
+    """Coordinates background transcription of audio chunks.
+
+    Tracks which audio has been sent for transcription vs. still accumulating.
+    A single worker thread processes chunks sequentially from a queue,
+    reusing the Whisper model across calls.
+
+    Args:
+        model_size: Whisper model size for transcription.
+        sample_rate: Audio sample rate (for progress calculation).
+    """
+
+    def __init__(self, model_size: str = "small", sample_rate: int = 16000):
+        self._model_size = model_size
+        self._sample_rate = sample_rate
+        self._chunks_ref: list[np.ndarray] | None = None
+        self._boundary: int = 0
+        self._queue: queue.Queue[np.ndarray | None] = queue.Queue()
+        self._transcripts: list[str] = []
+        self._errors: list[Exception] = []
+        self._stream_callback: Callable[[str], None] | None = None
+        self._total_samples_sent: int = 0
+        self._total_samples_done: int = 0
+        self._worker: threading.Thread | None = None
+        self._finished = threading.Event()
+
+    def bind_chunks(self, chunks: list[np.ndarray]) -> None:
+        """Bind to the recording's chunks list."""
+        self._chunks_ref = chunks
+
+    def set_stream_callback(self, callback: Callable[[str], None]) -> None:
+        """Set callback for streaming transcripts as they complete."""
+        self._stream_callback = callback
+
+    def start_worker(self) -> None:
+        """Start the background transcription thread."""
+        self._worker = threading.Thread(target=self._worker_loop, daemon=True)
+        self._worker.start()
+
+    def flush(self, boundary: int | None = None) -> bool:
+        """Enqueue audio from current boundary to the given index.
+
+        Args:
+            boundary: Chunk index to flush up to. If None, flush all.
+
+        Returns:
+            True if audio was enqueued, False if nothing new.
+        """
+        if self._chunks_ref is None:
+            return False
+
+        end = len(self._chunks_ref) if boundary is None else boundary
+        end = min(end, len(self._chunks_ref))
+
+        if end <= self._boundary:
+            return False
+
+        audio = np.concatenate(self._chunks_ref[self._boundary : end], axis=0)
+        self._boundary = end
+        self._total_samples_sent += len(audio)
+        self._queue.put(audio)
+        return True
+
+    def finish(self, timeout: float = 30.0) -> None:
+        """Flush remaining audio, signal worker to stop, and wait."""
+        self.flush()
+        if self._worker is not None:
+            self._queue.put(None)  # sentinel
+            self._worker.join(timeout=timeout)
+        self._finished.set()
+
+    def get_transcript(self) -> str:
+        """Join all completed transcripts."""
+        return " ".join(t for t in self._transcripts if t).strip()
+
+    def progress_fraction(self) -> float:
+        """Fraction of sent audio that has been transcribed (0.0-1.0)."""
+        if self._total_samples_sent == 0:
+            return 0.0
+        return self._total_samples_done / self._total_samples_sent
+
+    def is_done(self) -> bool:
+        """True when worker has finished processing all chunks."""
+        return self._finished.is_set()
+
+    def _worker_loop(self) -> None:
+        """Process chunks from the queue until sentinel."""
+        while True:
+            item = self._queue.get()
+            if item is None:
+                break
+            try:
+                text = transcribe_audio(item, model_size=self._model_size)
+                if text:
+                    self._transcripts.append(text)
+                    if self._stream_callback:
+                        self._stream_callback(text)
+                self._total_samples_done += len(item)
+            except Exception as e:
+                log.error("Chunk transcription failed: %s", e)
+                self._errors.append(e)
+                self._total_samples_done += len(item)
