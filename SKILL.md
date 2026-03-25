@@ -11,12 +11,15 @@ Record audio from the user's microphone, transcribe it locally, and treat the tr
 
 1. **Run the voice script** via Bash with `run_in_background: true` (recording has no time limit — the user controls when to stop via the GUI):
    ```
-   ~/.claude/venvs/voice/bin/python <skill_base_dir>/scripts/voice.py 2>/dev/null
+   ~/.claude/venvs/voice/bin/python <skill_base_dir>/scripts/voice.py --stream --debug 2>~/.config/claude-skill-voice/debug.log
    ```
    - On Windows, use `~/.claude/venvs/voice/Scripts/python.exe` instead of the Unix path above.
    - Use `run_in_background: true` on the Bash tool call. This avoids the 2-minute default timeout killing long recordings. You will be notified when the recording finishes.
-   - `2>/dev/null` suppresses stderr because the Bash tool merges stderr into stdout, which would mix progress messages ("Captured 9.6s...", "Transcribing...") into the transcript.
+   - The `2>` redirect is required because the Bash tool merges stderr into stdout, which would mix log messages into the transcript.
    - Replace `<skill_base_dir>` with the directory containing this SKILL.md file.
+   - `--stream` and `--debug` are always included in the command above. Do not remove them.
+     - `--stream` prints transcript chunks to stdout as they complete during recording. This gives the user visible feedback that transcription is working, and preserves partial transcript if the tool crashes mid-session.
+     - `--debug` enables debug-level logging to stderr. The `2>` redirect captures it to `~/.config/claude-skill-voice/debug.log` (overwritten each session) for troubleshooting. This tool is a work in progress with sharp edges — the debug log is essential for triaging failures.
    - Optional flags:
      - `--model tiny|base|small` (default: `base`). Use the model the user specifies, or `base` if unspecified.
      - `--device DEVICE_ID` to select a specific audio input device.
