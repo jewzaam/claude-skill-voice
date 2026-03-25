@@ -184,14 +184,34 @@ def transcribe_audio(
 ) -> str:
     """Transcribe raw audio data (int16 numpy array) using faster-whisper.
 
-    Saves to a temp WAV, transcribes, and cleans up. Used by ChunkManager
-    for individual chunks.
+    Passes the audio directly to the model as a float32 array, avoiding
+    temp WAV file I/O. Used by ChunkManager for individual chunks.
     """
-    wav_path = save_wav(audio_data)
+    logger.info("Transcribing with model '%s'...", model_size)
+    audio_duration = len(audio_data) / SAMPLE_RATE
+
+    # Convert int16 to float32 normalized [-1.0, 1.0] for faster-whisper
+    audio_float = audio_data.flatten().astype(np.float32) / 32768.0
+
     try:
-        return transcribe_wav(
-            wav_path, model_size=model_size, progress_callback=progress_callback
-        )
-    finally:
-        if os.path.exists(wav_path):
-            os.remove(wav_path)
+        model = _get_or_create_model(model_size)
+        devnull = open(os.devnull, "w")  # noqa: SIM115
+        saved_stdout = sys.stdout
+        sys.stdout = devnull
+        try:
+            segments, _ = model.transcribe(audio_float, beam_size=WHISPER_BEAM_SIZE)
+            text_parts = []
+            for seg in segments:
+                text_parts.append(seg.text.strip())
+                if progress_callback and audio_duration > 0:
+                    fraction = min(seg.end / audio_duration, 1.0)
+                    progress_callback(fraction)
+        finally:
+            sys.stdout = saved_stdout
+            devnull.close()
+    except Exception as e:
+        logger.error("Transcription failed: %s", e)
+        raise
+    if progress_callback:
+        progress_callback(1.0)
+    return " ".join(text_parts).strip()
