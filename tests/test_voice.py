@@ -667,10 +667,20 @@ def _mock_record_return(audio: np.ndarray) -> tuple[np.ndarray, MagicMock]:
     return (audio, mock_root)
 
 
+def _mock_chunk_manager(transcript=""):
+    """Create a mock ChunkManager class that returns an instance with
+    the given transcript."""
+    mock_mgr = MagicMock()
+    mock_mgr.get_transcript.return_value = transcript
+    mock_cls = MagicMock(return_value=mock_mgr)
+    return mock_cls, mock_mgr
+
+
 @pytest.mark.usefixtures("_no_lock")
 class TestMain:
     def test_empty_transcript_prints_done_only(self, capsys):
         mock_audio = np.zeros(16000, dtype=np.int16)
+        mock_cls, _ = _mock_chunk_manager("")
 
         with (
             patch("sys.argv", ["voice.py"]),
@@ -678,10 +688,7 @@ class TestMain:
                 "voice.record_with_gui",
                 return_value=_mock_record_return(mock_audio),
             ),
-            patch("voice.transcribe_with_progress", return_value=""),
-            patch("voice.save_wav", return_value="/tmp/fake.wav"),
-            patch("voice.os.path.exists", return_value=True),
-            patch("voice.os.remove"),
+            patch("voice.ChunkManager", mock_cls),
         ):
             with pytest.raises(SystemExit) as exc_info:
                 voice.main()
@@ -691,24 +698,28 @@ class TestMain:
         assert captured.out.strip() == "[DONE]"
 
     def test_recording_error_exits_nonzero(self):
+        _, mock_mgr = _mock_chunk_manager()
         with (
             patch("sys.argv", ["voice.py"]),
             patch(
                 "voice.record_with_gui",
                 side_effect=voice.RecordingError("No audio captured."),
             ),
+            patch("voice.ChunkManager", return_value=mock_mgr),
         ):
             with pytest.raises(SystemExit) as exc_info:
                 voice.main()
             assert exc_info.value.code == voice.EXIT_ERROR
 
     def test_recording_cancelled_prints_cancel(self, capsys):
+        _, mock_mgr = _mock_chunk_manager()
         with (
             patch("sys.argv", ["voice.py"]),
             patch(
                 "voice.record_with_gui",
                 side_effect=voice.RecordingCancelled("Recording cancelled."),
             ),
+            patch("voice.ChunkManager", return_value=mock_mgr),
         ):
             with pytest.raises(SystemExit) as exc_info:
                 voice.main()
@@ -719,6 +730,7 @@ class TestMain:
 
     def test_successful_transcript_prints_to_stdout(self, capsys):
         mock_audio = np.zeros(16000, dtype=np.int16)
+        mock_cls, _ = _mock_chunk_manager("hello world")
 
         with (
             patch("sys.argv", ["voice.py"]),
@@ -726,10 +738,7 @@ class TestMain:
                 "voice.record_with_gui",
                 return_value=_mock_record_return(mock_audio),
             ),
-            patch("voice.transcribe_with_progress", return_value="hello world"),
-            patch("voice.save_wav", return_value="/tmp/fake.wav"),
-            patch("voice.os.path.exists", return_value=True),
-            patch("voice.os.remove"),
+            patch("voice.ChunkManager", mock_cls),
         ):
             voice.main()
 
@@ -737,46 +746,6 @@ class TestMain:
         lines = captured.out.strip().split("\n")
         assert lines[0] == "[DONE]"
         assert lines[1] == "hello world"
-
-    def test_wav_cleanup_on_transcription_failure(self):
-        mock_audio = np.zeros(16000, dtype=np.int16)
-
-        with (
-            patch("sys.argv", ["voice.py"]),
-            patch(
-                "voice.record_with_gui",
-                return_value=_mock_record_return(mock_audio),
-            ),
-            patch(
-                "voice.transcribe_with_progress",
-                side_effect=RuntimeError("model error"),
-            ),
-            patch("voice.save_wav", return_value="/tmp/fake.wav"),
-            patch("voice.os.path.exists", return_value=True) as mock_exists,
-            patch("voice.os.remove") as mock_remove,
-        ):
-            with pytest.raises(RuntimeError, match="model error"):
-                voice.main()
-
-        mock_exists.assert_called_with("/tmp/fake.wav")
-        mock_remove.assert_called_with("/tmp/fake.wav")
-
-    def test_wav_cleanup_skipped_when_save_fails(self):
-        mock_audio = np.zeros(16000, dtype=np.int16)
-
-        with (
-            patch("sys.argv", ["voice.py"]),
-            patch(
-                "voice.record_with_gui",
-                return_value=_mock_record_return(mock_audio),
-            ),
-            patch("voice.save_wav", side_effect=OSError("disk full")),
-            patch("voice.os.remove") as mock_remove,
-        ):
-            with pytest.raises(OSError, match="disk full"):
-                voice.main()
-
-        mock_remove.assert_not_called()
 
     def test_list_devices_flag(self):
         mock_devices = [
@@ -800,8 +769,9 @@ class TestMain:
                 voice.main()
             assert exc_info.value.code == voice.EXIT_ERROR
 
-    def test_model_flag_passed_to_transcribe(self):
+    def test_model_flag_passed_to_chunk_manager(self):
         mock_audio = np.zeros(16000, dtype=np.int16)
+        mock_cls, _ = _mock_chunk_manager("hello")
 
         with (
             patch("sys.argv", ["voice.py", "--model", "tiny"]),
@@ -809,67 +779,33 @@ class TestMain:
                 "voice.record_with_gui",
                 return_value=_mock_record_return(mock_audio),
             ),
-            patch(
-                "voice.transcribe_with_progress", return_value="hello"
-            ) as mock_transcribe,
-            patch("voice.save_wav", return_value="/tmp/fake.wav"),
-            patch("voice.os.path.exists", return_value=True),
-            patch("voice.os.remove"),
+            patch("voice.ChunkManager", mock_cls),
         ):
             voice.main()
 
-        mock_transcribe.assert_called_once()
-        args, kwargs = mock_transcribe.call_args
-        assert args[0] == "/tmp/fake.wav"
-        assert kwargs["model_size"] == "tiny"
+        mock_cls.assert_called_once_with(model_size="tiny")
 
-    def test_root_passed_to_transcribe_with_progress(self):
+    def test_chunk_manager_passed_to_record(self):
         mock_audio = np.zeros(16000, dtype=np.int16)
-        mock_root = MagicMock()
+        mock_cls, mock_mgr = _mock_chunk_manager("hello")
 
         with (
             patch("sys.argv", ["voice.py"]),
             patch(
                 "voice.record_with_gui",
-                return_value=(mock_audio, mock_root),
-            ),
-            patch(
-                "voice.transcribe_with_progress", return_value="hello"
-            ) as mock_transcribe,
-            patch("voice.save_wav", return_value="/tmp/fake.wav"),
-            patch("voice.os.path.exists", return_value=True),
-            patch("voice.os.remove"),
+                return_value=_mock_record_return(mock_audio),
+            ) as mock_record,
+            patch("voice.ChunkManager", mock_cls),
         ):
             voice.main()
 
-        kwargs = mock_transcribe.call_args[1]
-        assert kwargs["root"] is mock_root
-
-    def test_root_destroyed_on_transcription_failure(self):
-        mock_audio = np.zeros(16000, dtype=np.int16)
-        mock_root = MagicMock()
-
-        with (
-            patch("sys.argv", ["voice.py"]),
-            patch(
-                "voice.record_with_gui",
-                return_value=(mock_audio, mock_root),
-            ),
-            patch(
-                "voice.transcribe_with_progress",
-                side_effect=RuntimeError("model error"),
-            ),
-            patch("voice.save_wav", return_value="/tmp/fake.wav"),
-            patch("voice.os.path.exists", return_value=True),
-            patch("voice.os.remove"),
-        ):
-            with pytest.raises(RuntimeError, match="model error"):
-                voice.main()
-
-        mock_root.destroy.assert_called_once()
+        mock_record.assert_called_once()
+        kwargs = mock_record.call_args[1]
+        assert kwargs["chunk_manager"] is mock_mgr
 
     def test_device_flag_passed_to_record(self):
         mock_audio = np.zeros(16000, dtype=np.int16)
+        mock_cls, _ = _mock_chunk_manager("hello")
 
         with (
             patch("sys.argv", ["voice.py", "--device", "5"]),
@@ -877,17 +813,47 @@ class TestMain:
                 "voice.record_with_gui",
                 return_value=_mock_record_return(mock_audio),
             ) as mock_record,
-            patch("voice.transcribe_with_progress", return_value="hello"),
-            patch("voice.save_wav", return_value="/tmp/fake.wav"),
-            patch("voice.os.path.exists", return_value=True),
-            patch("voice.os.remove"),
+            patch("voice.ChunkManager", mock_cls),
         ):
             voice.main()
 
         mock_record.assert_called_once()
-        args, kwargs = mock_record.call_args
-        assert args[0] == os.getcwd()
+        kwargs = mock_record.call_args[1]
         assert kwargs["device_id"] == 5
+
+    def test_stream_flag_sets_callback(self):
+        mock_audio = np.zeros(16000, dtype=np.int16)
+        mock_cls, mock_mgr = _mock_chunk_manager("streamed")
+
+        with (
+            patch("sys.argv", ["voice.py", "--stream"]),
+            patch(
+                "voice.record_with_gui",
+                return_value=_mock_record_return(mock_audio),
+            ),
+            patch("voice.ChunkManager", mock_cls),
+        ):
+            voice.main()
+
+        mock_mgr.set_stream_callback.assert_called_once()
+
+    def test_stream_flag_skips_final_print(self, capsys):
+        mock_audio = np.zeros(16000, dtype=np.int16)
+        mock_cls, _ = _mock_chunk_manager("already streamed")
+
+        with (
+            patch("sys.argv", ["voice.py", "--stream"]),
+            patch(
+                "voice.record_with_gui",
+                return_value=_mock_record_return(mock_audio),
+            ),
+            patch("voice.ChunkManager", mock_cls),
+        ):
+            voice.main()
+
+        captured = capsys.readouterr()
+        assert captured.out.strip() == "[DONE]"
+        assert "already streamed" not in captured.out
 
 
 @pytest.fixture(autouse=False)
@@ -1214,9 +1180,9 @@ class TestWavInputOutput:
 
         mock_lock.assert_not_called()
 
-    def test_wav_output_writes_to_path(self, tmp_path):
+    def test_wav_output_saves_file(self, tmp_path):
         mock_audio = np.zeros(16000, dtype=np.int16)
-        mock_root = MagicMock()
+        mock_cls, _ = _mock_chunk_manager("hello")
         output_path = str(tmp_path / "saved.wav")
 
         with (
@@ -1226,23 +1192,19 @@ class TestWavInputOutput:
             ),
             patch(
                 "voice.record_with_gui",
-                return_value=(mock_audio, mock_root),
+                return_value=_mock_record_return(mock_audio),
             ),
-            patch("voice.transcribe_with_progress", return_value="hello"),
+            patch("voice.ChunkManager", mock_cls),
             patch("voice.save_wav_to") as mock_save,
-            patch("voice.os.remove") as mock_remove,
         ):
             voice.main()
 
-        # Writes directly to the output path
         mock_save.assert_called_once()
         assert mock_save.call_args[0][1] == os.path.abspath(output_path)
-        # Does not delete the user's file
-        mock_remove.assert_not_called()
 
     def test_wav_output_still_transcribes(self, tmp_path, capsys):
         mock_audio = np.zeros(16000, dtype=np.int16)
-        mock_root = MagicMock()
+        mock_cls, _ = _mock_chunk_manager("hello world")
         output_path = str(tmp_path / "saved.wav")
 
         with (
@@ -1252,9 +1214,9 @@ class TestWavInputOutput:
             ),
             patch(
                 "voice.record_with_gui",
-                return_value=(mock_audio, mock_root),
+                return_value=_mock_record_return(mock_audio),
             ),
-            patch("voice.transcribe_with_progress", return_value="hello world"),
+            patch("voice.ChunkManager", mock_cls),
             patch("voice.save_wav_to"),
         ):
             voice.main()

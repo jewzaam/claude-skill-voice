@@ -882,6 +882,11 @@ def main() -> None:
         help="Transcribe from an existing WAV file instead of recording",
     )
     parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="Stream transcript chunks to stdout as they complete",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging to stderr",
@@ -936,10 +941,20 @@ def main() -> None:
         start_whisper_preload()
         cfg = Config()
         cwd = os.getcwd()
+
+        # Create chunk manager for background transcription during recording
+        chunk_mgr = ChunkManager(model_size=args.model)
+        if args.stream:
+            chunk_mgr.set_stream_callback(lambda text: print(text, flush=True))
+        chunk_mgr.start_worker()
+
         gui_root: tk.Tk | None = None
         try:
             audio_data, gui_root = record_with_gui(
-                cwd, device_id=args.device, config=cfg
+                cwd,
+                device_id=args.device,
+                config=cfg,
+                chunk_manager=chunk_mgr,
             )
         except RecordingCancelled:
             print("[CANCEL]")
@@ -948,59 +963,30 @@ def main() -> None:
             log.error("%s", e)
             sys.exit(EXIT_ERROR)
 
+        # GUI handled "Transcribing..." phase — root is already quit
+        if gui_root is not None:
+            try:
+                gui_root.destroy()
+            except Exception:
+                pass
+
+        # Save WAV if requested
         audio_duration = len(audio_data) / SAMPLE_RATE
-        if cfg.transcribe_ratio is not None:
-            est = audio_duration * cfg.transcribe_ratio
-            log.info("Estimated transcription time: %.0fs", est)
+        if args.wav_output:
+            wav_path = os.path.abspath(args.wav_output)
+            save_wav_to(audio_data, wav_path)
+            log.info("Saved audio to %s", wav_path)
 
-        wav_path = None
-        delete_wav = True
-        try:
-            if args.wav_output:
-                wav_path = os.path.abspath(args.wav_output)
-                save_wav_to(audio_data, wav_path)
-                log.info("Saved audio to %s", wav_path)
-                delete_wav = False
-            else:
-                wav_path = save_wav(audio_data)
-
-            t_start = time.time()
-            transcript = transcribe_with_progress(
-                wav_path,
-                root=gui_root,
-                model_size=args.model,
-                audio_duration=audio_duration,
-                transcribe_ratio=cfg.transcribe_ratio,
-            )
-            gui_root = None  # transcribe_with_progress destroyed it
-            t_elapsed = time.time() - t_start
-            if audio_duration > 0:
-                new_ratio = t_elapsed / audio_duration
-                cfg.transcribe_ratio = new_ratio
-                cfg.save()
-                log.debug(
-                    "transcription took %.1fs for %.1fs audio (ratio=%.4f)",
-                    t_elapsed,
-                    audio_duration,
-                    new_ratio,
-                )
-        finally:
-            if delete_wav and wav_path and os.path.exists(wav_path):
-                os.remove(wav_path)
-            if gui_root is not None:
-                try:
-                    gui_root.destroy()
-                except Exception:
-                    pass
+        transcript = chunk_mgr.get_transcript()
 
         if not transcript:
             print("[DONE]")
             log.warning("No speech detected in audio.")
             sys.exit(EXIT_SUCCESS)
 
-        # stdout: status line then transcript (what Claude Code reads)
         print("[DONE]")
-        print(transcript)
+        if not args.stream:
+            print(transcript)
     finally:
         _release_lock()
 
