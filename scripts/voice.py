@@ -21,6 +21,8 @@ import sys
 import time
 import wave
 
+__version__ = "0.2.0"
+
 try:
     import tkinter as tk
 except ModuleNotFoundError:
@@ -57,6 +59,21 @@ def _sanitize_transcript(text: str) -> str:
     return text.encode(sys.stdout.encoding or "utf-8", errors="replace").decode(
         sys.stdout.encoding or "utf-8", errors="replace"
     )
+
+
+def emit_begin(flush: bool = False) -> None:
+    """Print the [BEGIN version=...] marker to stdout."""
+    print(f"[BEGIN version={__version__}]", flush=flush)
+
+
+def emit_end() -> None:
+    """Print the [END] marker to stdout."""
+    print("[END]")
+
+
+def emit_cancel() -> None:
+    """Print the [CANCEL] marker to stdout."""
+    print("[CANCEL]")
 
 
 APP_NAME = "claude-skill-voice"
@@ -756,6 +773,8 @@ def main() -> None:
     logger.addHandler(handler)
     logger.setLevel(log_level)
 
+    logger.info("claude-skill-voice %s", __version__)
+
     if args.list_devices:
         devices = _get_input_devices()
         if not devices:
@@ -785,9 +804,9 @@ def main() -> None:
             t_elapsed,
             args.model,
         )
-        print("[BEGIN]")
+        emit_begin()
         print(_sanitize_transcript(transcript))
-        print("[END]")
+        emit_end()
         sys.exit(EXIT_SUCCESS)
 
     try:
@@ -810,7 +829,7 @@ def main() -> None:
 
             def _stream_chunk(text: str) -> None:
                 if not begun[0]:
-                    print("[BEGIN]", flush=True)
+                    emit_begin(flush=True)
                     begun[0] = True
                 print(_sanitize_transcript(text), flush=True)
 
@@ -828,7 +847,7 @@ def main() -> None:
         except RecordingCancelled:
             # In stream mode, [BEGIN] + chunks may already be on stdout.
             # [CANCEL] terminates the block (or stands alone if no [BEGIN]).
-            print("[CANCEL]")
+            emit_cancel()
             sys.exit(EXIT_SUCCESS)
         except RecordingError as e:
             logger.error("%s", e)
@@ -851,18 +870,18 @@ def main() -> None:
         transcript = chunk_mgr.get_transcript()
 
         if not transcript:
-            print("[BEGIN]")
-            print("[END]")
+            emit_begin()
+            emit_end()
             logger.warning("No speech detected in audio.")
             sys.exit(EXIT_SUCCESS)
 
         if args.stream:
             # Chunks already streamed with [BEGIN] prefix
-            print("[END]")
+            emit_end()
         else:
-            print("[BEGIN]")
+            emit_begin()
             print(_sanitize_transcript(transcript))
-            print("[END]")
+            emit_end()
     finally:
         _release_lock()
 

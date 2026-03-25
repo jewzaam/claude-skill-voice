@@ -28,11 +28,11 @@ Record audio from the user's microphone, transcribe it locally, and treat the tr
 2. **Wait for completion** -- after launching in the background, tell the user that recording has started and they should press Done (or Enter) when finished. You will be automatically notified when the background task completes. Then read the output file to get the transcript.
 
 3. **Parse the output** -- stdout uses marker lines to delimit the transcript:
-   - `[CANCEL]` — the user cancelled. This can appear alone (cancelled before speaking) or after `[BEGIN]` and partial transcript lines (cancelled during transcription). In either case, **do nothing** — do not ask them to try again, do not comment on it. Discard any partial transcript. Just stop.
-   - `[BEGIN]` — marks the start of transcript output. All lines between `[BEGIN]` and `[END]` are transcript text. Line breaks within the transcript indicate the user paused (via the Pause button or a natural gap in speech).
-   - `[END]` — marks the end of transcript output. If there is no text between `[BEGIN]` and `[END]`, no speech was detected — tell the user and ask them to try again.
+   - `[CANCEL]` — the user cancelled. This can appear alone (cancelled before speaking) or after `[BEGIN ...]` and partial transcript lines (cancelled during transcription). In either case, **do nothing** — do not ask them to try again, do not comment on it. Discard any partial transcript. Just stop.
+   - `[BEGIN version=X.Y.Z]` — marks the start of transcript output. The version attribute identifies which build produced the output. All lines between `[BEGIN ...]` and `[END]` are transcript text. Line breaks within the transcript indicate the user paused (via the Pause button or a natural gap in speech). Match `[BEGIN` as a prefix — ignore attributes when parsing.
+   - `[END]` — marks the end of transcript output. If there is no text between `[BEGIN ...]` and `[END]`, no speech was detected — tell the user and ask them to try again.
 
-4. **Handle errors** (non-zero exit, no `[BEGIN]` line):
+4. **Handle errors** (non-zero exit, no `[BEGIN` line):
    - If stderr contains "already running", tell the user: "A voice recording session is already in progress. Please finish that session before starting a new one."
    - For other failures (e.g., `ModuleNotFoundError`, missing Python executable, or import errors), tell the user: "Voice capture failed. Make sure you've run `make install` in your skills/voice directory (e.g., `cd ~/.claude/skills/voice && make install`) to create the virtual environment and install dependencies." Also suggest checking microphone permissions if the error is not dependency-related.
 

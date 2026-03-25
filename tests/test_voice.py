@@ -659,7 +659,7 @@ class TestMain:
 
         captured = capsys.readouterr()
         lines = captured.out.strip().split("\n")
-        assert lines[0] == "[BEGIN]"
+        assert lines[0].startswith("[BEGIN")
         assert lines[1] == "[END]"
 
     def test_recording_error_exits_nonzero(self):
@@ -709,7 +709,7 @@ class TestMain:
 
         captured = capsys.readouterr()
         lines = captured.out.strip().split("\n")
-        assert lines[0] == "[BEGIN]"
+        assert lines[0].startswith("[BEGIN")
         assert lines[1] == "hello world"
         assert lines[2] == "[END]"
 
@@ -1044,7 +1044,7 @@ class TestWavInputOutput:
 
         captured = capsys.readouterr()
         lines = captured.out.strip().split("\n")
-        assert lines[0] == "[BEGIN]"
+        assert lines[0].startswith("[BEGIN")
         assert lines[-1] == "[END]"
         assert "[CANCEL]" not in captured.out
 
@@ -1109,6 +1109,6 @@ class TestWavInputOutput:
 
         captured = capsys.readouterr()
         lines = captured.out.strip().split("\n")
-        assert lines[0] == "[BEGIN]"
+        assert lines[0].startswith("[BEGIN")
         assert lines[1] == "hello world"
         assert lines[2] == "[END]"
