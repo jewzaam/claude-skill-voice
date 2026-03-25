@@ -15,7 +15,7 @@ import numpy as np
 
 from whisper import transcribe_audio
 
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class SilenceDetector:
@@ -35,9 +35,9 @@ class SilenceDetector:
 
     def __init__(
         self,
-        threshold: float = 0.02,
-        duration_s: float = 1.5,
-        min_chunk_s: float = 3.0,
+        threshold: float = 0.08,
+        duration_s: float = 1.0,
+        min_chunk_s: float = 1.0,
         buffer_s: float = 0.5,
         callback_interval_s: float = 0.01,
     ):
@@ -90,6 +90,55 @@ class SilenceDetector:
         self._triggered = False
 
 
+SILENCE_PEAK_THRESHOLD = 0.08  # same as SilenceDetector default
+SILENCE_BUFFER_S = 0.5
+
+
+def trim_silence(
+    audio: np.ndarray,
+    sample_rate: int = 16000,
+    threshold: float = SILENCE_PEAK_THRESHOLD,
+    buffer_s: float = SILENCE_BUFFER_S,
+) -> np.ndarray | None:
+    """Trim silence from both ends of an audio chunk.
+
+    Scans for the first and last samples where the level exceeds the
+    threshold, then keeps buffer_s of padding on each side.
+
+    Returns None if no speech is found (entire chunk is silence).
+    """
+    block_size = max(1, sample_rate // 40)  # ~25ms blocks, matches callback size
+    buffer_samples = int(buffer_s * sample_rate)
+    n = len(audio)
+
+    # Find first block with speech
+    first_speech = None
+    for i in range(0, n, block_size):
+        block = audio[i : i + block_size]
+        peak = int(np.max(np.abs(block)))
+        level = min(peak / 32768.0 * 4.0, 1.0)
+        if level >= threshold:
+            first_speech = i
+            break
+
+    if first_speech is None:
+        return None  # all silence
+
+    # Find last block with speech
+    last_speech = first_speech
+    for i in range(0, n, block_size):
+        block = audio[i : i + block_size]
+        peak = int(np.max(np.abs(block)))
+        level = min(peak / 32768.0 * 4.0, 1.0)
+        if level >= threshold:
+            last_speech = i + block_size
+
+    start = max(0, first_speech - buffer_samples)
+    end = min(n, last_speech + buffer_samples)
+
+    return audio[start:end]
+
+
 class ChunkManager:
     """Coordinates background transcription of audio chunks.
 
@@ -119,6 +168,11 @@ class ChunkManager:
     def bind_chunks(self, chunks: list[np.ndarray]) -> None:
         """Bind to the recording's chunks list."""
         self._chunks_ref = chunks
+
+    @property
+    def boundary(self) -> int:
+        """Index into chunks list: everything before this has been flushed."""
+        return self._boundary
 
     def set_stream_callback(self, callback: Callable[[str], None]) -> None:
         """Set callback for streaming transcripts as they complete."""
@@ -171,11 +225,30 @@ class ChunkManager:
         """Join all completed transcripts."""
         return " ".join(t for t in self._transcripts if t).strip()
 
-    def progress_fraction(self) -> float:
-        """Fraction of sent audio that has been transcribed (0.0-1.0)."""
-        if self._total_samples_sent == 0:
+    def total_samples_recorded(self) -> int:
+        """Total samples in the bound chunks list (including un-flushed)."""
+        if self._chunks_ref is None:
+            return 0
+        return sum(len(c) for c in self._chunks_ref)
+
+    def queued_fraction(self) -> float:
+        """Fraction of recorded audio that has been queued (0.0-1.0)."""
+        total = self.total_samples_recorded()
+        if total == 0:
             return 0.0
-        return self._total_samples_done / self._total_samples_sent
+        return self._total_samples_sent / total
+
+    def progress_fraction(self) -> float:
+        """Fraction of all recorded audio that has been transcribed (0.0-1.0).
+
+        Denominator is total recorded samples (not just flushed), so the bar
+        reflects how much of the full recording is done. New audio being
+        recorded pushes the fraction down.
+        """
+        total = self.total_samples_recorded()
+        if total == 0:
+            return 0.0
+        return self._total_samples_done / total
 
     def is_done(self) -> bool:
         """True when worker has finished processing all chunks."""
@@ -183,20 +256,64 @@ class ChunkManager:
 
     def _worker_loop(self) -> None:
         """Process chunks from the queue until sentinel."""
+        chunk_num = 0
         try:
             while True:
                 item = self._queue.get()
                 if item is None:
                     break
+                chunk_num += 1
+                original_samples = len(item)
+
+                # Trim silence from both ends
+                trimmed = trim_silence(item, sample_rate=self._sample_rate)
+                if trimmed is None:
+                    logger.info(
+                        "chunk %d: skipped, all silence (%d samples)",
+                        chunk_num,
+                        original_samples,
+                    )
+                    self._total_samples_done += original_samples
+                    continue
+
+                duration_s = len(trimmed) / self._sample_rate
+                logger.info(
+                    "chunk %d: samples=%d, trimmed=%d, duration=%.1fs",
+                    chunk_num,
+                    original_samples,
+                    len(trimmed),
+                    duration_s,
+                )
                 try:
-                    text = transcribe_audio(item, model_size=self._model_size)
+                    # Track progress incrementally via segment callbacks
+                    chunk_samples = len(item)
+                    samples_before = self._total_samples_done
+
+                    def on_segment_progress(fraction: float) -> None:
+                        self._total_samples_done = samples_before + int(
+                            fraction * chunk_samples
+                        )
+
+                    text = transcribe_audio(
+                        trimmed,
+                        model_size=self._model_size,
+                        progress_callback=on_segment_progress,
+                    )
+                    # Ensure we account for the full chunk
+                    self._total_samples_done = samples_before + chunk_samples
                     if text:
                         self._transcripts.append(text)
                         if self._stream_callback:
                             self._stream_callback(text)
-                    self._total_samples_done += len(item)
+                        logger.debug(
+                            "chunk %d transcribed: %d chars",
+                            chunk_num,
+                            len(text),
+                        )
+                    else:
+                        logger.debug("chunk %d: no speech detected", chunk_num)
                 except Exception as e:
-                    log.error("Chunk transcription failed: %s", e)
+                    logger.error("Chunk transcription failed: %s", e)
                     self._errors.append(e)
                     self._total_samples_done += len(item)
         finally:

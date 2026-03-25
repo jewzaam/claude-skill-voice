@@ -18,9 +18,7 @@ import json
 import logging
 import os
 import sys
-import tempfile
 import time
-import uuid
 import wave
 
 try:
@@ -35,21 +33,30 @@ except ModuleNotFoundError:
     )
     sys.exit(1)
 
-import threading
-
 import numpy as np
 import sounddevice as sd
 
 from chunks import ChunkManager, SilenceDetector  # noqa: F401
-from whisper import AUDIO_CHANNELS  # noqa: F401
-from whisper import AUDIO_SAMPLE_WIDTH  # noqa: F401
-from whisper import DEFAULT_MODEL_SIZE  # noqa: F401
-from whisper import SAMPLE_RATE  # noqa: F401
-from whisper import start_whisper_preload  # noqa: F401
-from whisper import transcribe_audio  # noqa: F401
+from whisper import AUDIO_CHANNELS
+from whisper import DEFAULT_MODEL_SIZE
+from whisper import SAMPLE_RATE
+from whisper import save_wav_to
+from whisper import start_whisper_preload
 from whisper import transcribe_wav
 
-log = logging.getLogger(__name__)
+logger = logging.getLogger("voice")
+
+
+def _sanitize_transcript(text: str) -> str:
+    """Replace characters that can't be encoded in the console's charset.
+
+    Whisper occasionally hallucinates non-Latin scripts (Georgian, CJK, etc.)
+    from ambient noise. These crash on Windows cp1252 stdout. Replace them
+    with '?' to ensure output always succeeds.
+    """
+    return text.encode(sys.stdout.encoding or "utf-8", errors="replace").decode(
+        sys.stdout.encoding or "utf-8", errors="replace"
+    )
 
 
 APP_NAME = "claude-skill-voice"
@@ -57,7 +64,6 @@ CONFIG_FILENAME = "settings.json"
 LOCK_FILENAME = "voice.lock"
 CONFIG_KEY_WINDOW_X = "window_x"
 CONFIG_KEY_WINDOW_Y = "window_y"
-CONFIG_KEY_TRANSCRIBE_RATIO = "transcribe_ratio"
 
 AUDIO_DTYPE = "int16"
 
@@ -86,16 +92,12 @@ LEVEL_UPDATE_MS = 50
 LEVEL_COLOR = "#888888"
 LEVEL_BG_COLOR = "#d0d0d0"
 
-PROGRESS_BAR_WIDTH = 260
-PROGRESS_BAR_HEIGHT = 18
-PROGRESS_COLOR = COLOR_DONE
-PROGRESS_BG_COLOR = "#d0d0d0"
-PROGRESS_UPDATE_MS = 200
 COLOR_TRANSCRIBING = "#4477cc"
 
 CHUNK_PROGRESS_HEIGHT = 6
-CHUNK_PROGRESS_COLOR = COLOR_TRANSCRIBING
-CHUNK_STATUS_UPDATE_MS = 300
+CHUNK_PROGRESS_QUEUED = "#ddaa44"  # amber — audio queued, not yet transcribed
+CHUNK_PROGRESS_DONE = COLOR_TRANSCRIBING  # blue — transcribed
+CHUNK_PROGRESS_BG = "#d0d0d0"
 TRANSCRIBING_POLL_MS = 200
 
 
@@ -164,17 +166,6 @@ class Config:
     def window_y(self, value: int) -> None:
         self._data[CONFIG_KEY_WINDOW_Y] = value
 
-    @property
-    def transcribe_ratio(self) -> float | None:
-        raw = self._data.get(CONFIG_KEY_TRANSCRIBE_RATIO)
-        if isinstance(raw, (int, float)) and raw > 0:
-            return float(raw)
-        return None
-
-    @transcribe_ratio.setter
-    def transcribe_ratio(self, value: float) -> None:
-        self._data[CONFIG_KEY_TRANSCRIBE_RATIO] = round(value, 4)
-
 
 def _lock_path() -> str:
     """Return path to the PID lockfile."""
@@ -241,7 +232,7 @@ def _acquire_lock() -> None:
     # Fast path: try atomic create
     try:
         _write_lock_file(path, my_pid)
-        log.debug("lock acquired: pid=%d", my_pid)
+        logger.debug("lock acquired: pid=%d", my_pid)
         return
     except FileExistsError:
         pass
@@ -250,25 +241,25 @@ def _acquire_lock() -> None:
     lock_pid = _read_lock_pid()
 
     if lock_pid is not None and lock_pid == my_pid:
-        log.debug("lock already owned by us: pid=%d", my_pid)
+        logger.debug("lock already owned by us: pid=%d", my_pid)
         return
 
     if lock_pid is not None and _is_pid_alive(lock_pid):
-        log.debug("lock held by live process: pid=%d", lock_pid)
+        logger.debug("lock held by live process: pid=%d", lock_pid)
         raise LockAcquireError(
             "Another voice recording session is already running. "
             "Finish that session before starting a new one."
         )
 
     # Stale lock (process dead or bad PID) — remove and retry
-    log.debug("removing stale lock: pid=%s", lock_pid)
+    logger.debug("removing stale lock: pid=%s", lock_pid)
     try:
         os.remove(path)
     except OSError:
         pass
     try:
         _write_lock_file(path, my_pid)
-        log.debug("lock acquired after stale cleanup: pid=%d", my_pid)
+        logger.debug("lock acquired after stale cleanup: pid=%d", my_pid)
     except FileExistsError:
         raise LockAcquireError(
             "Failed to acquire lock. Another session may have started."
@@ -279,7 +270,7 @@ def _release_lock() -> None:
     """Remove the PID lockfile only if we own it."""
     lock_pid = _read_lock_pid()
     if lock_pid is not None and lock_pid != os.getpid():
-        log.warning(
+        logger.warning(
             "lock not owned by us (owner=%d, self=%d), not releasing",
             lock_pid,
             os.getpid(),
@@ -287,7 +278,7 @@ def _release_lock() -> None:
         return
     try:
         os.remove(_lock_path())
-        log.debug("lock released")
+        logger.debug("lock released")
     except OSError:
         pass
 
@@ -355,7 +346,7 @@ def record_with_gui(
         config = Config()
     if device_id is None:
         device_id = _get_default_input_device()
-        log.debug("resolved default input device: %d", device_id)
+        logger.debug("resolved default input device: %d", device_id)
 
     chunks: list[np.ndarray] = []
     recording = True
@@ -378,22 +369,23 @@ def record_with_gui(
     def audio_callback(indata, _frames, _time_info, status):
         callback_count[0] += 1
         if status:
-            log.warning("audio_callback status: %s", status)
+            logger.warning("audio_callback status: %s", status)
         if recording and not paused:
             chunks.append(indata.copy())
             peak = int(np.max(np.abs(indata)))
             current_level[0] = min(peak / 32768.0 * 4.0, 1.0)
             if callback_count[0] % 50 == 0:
-                log.debug(
-                    "callback #%d, chunks=%d, peak=%d",
+                logger.debug(
+                    "callback=%d, chunks=%d, peak=%d, level=%.4f",
                     callback_count[0],
                     len(chunks),
                     peak,
+                    current_level[0],
                 )
             # Feed silence detector (non-blocking, pure arithmetic)
             if silence_detector is not None and chunk_manager is not None:
                 accumulated_s = (
-                    (len(chunks) - chunk_manager._boundary) * len(indata) / SAMPLE_RATE
+                    (len(chunks) - chunk_manager.boundary) * len(indata) / SAMPLE_RATE
                 )
                 boundary = silence_detector.feed(
                     current_level[0], len(chunks) - 1, accumulated_s
@@ -412,7 +404,7 @@ def record_with_gui(
             device=device_id,
         )
     except Exception as e:
-        log.error("Failed to access microphone: %s", e)
+        logger.error("Failed to access microphone: %s", e)
         sys.exit(EXIT_ERROR)
 
     root = tk.Tk()
@@ -446,17 +438,6 @@ def record_with_gui(
         row=0, column=1, sticky="e"
     )
 
-    tk.Label(timer_frame, text="Transcribe:", font=FONT_STATUS, fg=COLOR_MUTED).grid(
-        row=1, column=0, sticky="w", padx=(0, 5)
-    )
-    transcribe_est_var = tk.StringVar(value="unknown")
-    tk.Label(
-        timer_frame,
-        textvariable=transcribe_est_var,
-        font=FONT_STATUS,
-        fg=COLOR_MUTED,
-    ).grid(row=1, column=1, sticky="e")
-
     display_cwd = _truncate_path(_home_relative_path(cwd))
     tk.Label(frame, text=display_cwd, font=FONT_DETAIL, fg=COLOR_MUTED).pack()
 
@@ -478,21 +459,22 @@ def record_with_gui(
     )
 
     # Chunk transcription progress bar (only visible when chunk_manager active)
+    # Two layers: queued (amber) behind done (blue)
     chunk_progress_canvas = tk.Canvas(
         frame,
         width=LEVEL_BAR_WIDTH,
         height=CHUNK_PROGRESS_HEIGHT,
-        bg=PROGRESS_BG_COLOR,
+        bg=CHUNK_PROGRESS_BG,
         highlightthickness=0,
     )
-    chunk_progress_bar = chunk_progress_canvas.create_rectangle(
-        0, 0, 0, CHUNK_PROGRESS_HEIGHT, fill=CHUNK_PROGRESS_COLOR, width=0
+    chunk_bar_queued = chunk_progress_canvas.create_rectangle(
+        0, 0, 0, CHUNK_PROGRESS_HEIGHT, fill=CHUNK_PROGRESS_QUEUED, width=0
+    )
+    chunk_bar_done = chunk_progress_canvas.create_rectangle(
+        0, 0, 0, CHUNK_PROGRESS_HEIGHT, fill=CHUNK_PROGRESS_DONE, width=0
     )
     if chunk_manager is not None:
         chunk_progress_canvas.pack(pady=(0, 10))
-    else:
-        chunk_progress_canvas.pack(pady=(0, 10))
-        chunk_progress_canvas.pack_forget()  # hidden when no chunking
 
     button_frame = tk.Frame(frame)
     button_frame.pack()
@@ -537,7 +519,14 @@ def record_with_gui(
         else:
             # Flush accumulated audio before pausing
             if chunk_manager is not None:
-                chunk_manager.flush()
+                prev = chunk_manager.boundary
+                flushed = chunk_manager.flush()
+                if flushed:
+                    logger.info(
+                        "pause flush: chunks %d-%d",
+                        prev,
+                        chunk_manager.boundary,
+                    )
                 silence_flush_boundary[0] = None
             pause_start = time.time()
             paused = True
@@ -553,7 +542,10 @@ def record_with_gui(
 
         if chunk_manager is not None:
             # Transition to "Transcribing..." mode in same window
-            chunk_manager.flush()  # flush remaining audio
+            prev = chunk_manager.boundary
+            flushed = chunk_manager.flush()
+            if flushed:
+                logger.info("done flush: chunks %d-%d", prev, chunk_manager.boundary)
             chunk_manager.finish(timeout=0)  # send sentinel, don't block
 
             # Gray out buttons
@@ -567,10 +559,13 @@ def record_with_gui(
             current_level[0] = 0.0
 
             def poll_transcription():
-                frac = chunk_manager.progress_fraction()
-                bar_w = int(frac * LEVEL_BAR_WIDTH)
+                queued_w = int(chunk_manager.queued_fraction() * LEVEL_BAR_WIDTH)
+                done_w = int(chunk_manager.progress_fraction() * LEVEL_BAR_WIDTH)
                 chunk_progress_canvas.coords(
-                    chunk_progress_bar, 0, 0, bar_w, CHUNK_PROGRESS_HEIGHT
+                    chunk_bar_queued, 0, 0, queued_w, CHUNK_PROGRESS_HEIGHT
+                )
+                chunk_progress_canvas.coords(
+                    chunk_bar_done, 0, 0, done_w, CHUNK_PROGRESS_HEIGHT
                 )
                 if chunk_manager.is_done():
                     root.quit()
@@ -631,17 +626,11 @@ def record_with_gui(
     root.bind("<space>", lambda _e: toggle_pause())
     root.bind("<Return>", lambda _e: done_recording())
 
-    saved_ratio = config.transcribe_ratio
-
     def update_timer():
         if recording and not paused:
             elapsed = int(time.time() - start_time - paused_elapsed)
             mins, secs = divmod(elapsed, 60)
             elapsed_var.set(f"{mins}:{secs:02d}")
-            if saved_ratio is not None:
-                est = int(elapsed * saved_ratio)
-                est_mins, est_secs = divmod(est, 60)
-                transcribe_est_var.set(f"{est_mins}:{est_secs:02d}")
             after_id = root.after(TIMER_UPDATE_MS, update_timer)
             pending_after_ids.append(after_id)
 
@@ -655,15 +644,24 @@ def record_with_gui(
             if chunk_manager is not None and silence_flush_boundary[0] is not None:
                 boundary = silence_flush_boundary[0]
                 silence_flush_boundary[0] = None
+                prev = chunk_manager.boundary
                 chunk_manager.flush(boundary=boundary)
-                log.debug("silence flush at boundary %d", boundary)
+                logger.info(
+                    "silence flush: chunks %d-%d, level=%.4f",
+                    prev,
+                    boundary,
+                    current_level[0],
+                )
 
-            # Update chunk progress bar
+            # Update chunk progress bar (queued = amber, done = blue)
             if chunk_manager is not None:
-                frac = chunk_manager.progress_fraction()
-                bar_w = int(frac * LEVEL_BAR_WIDTH)
+                queued_w = int(chunk_manager.queued_fraction() * LEVEL_BAR_WIDTH)
+                done_w = int(chunk_manager.progress_fraction() * LEVEL_BAR_WIDTH)
                 chunk_progress_canvas.coords(
-                    chunk_progress_bar, 0, 0, bar_w, CHUNK_PROGRESS_HEIGHT
+                    chunk_bar_queued, 0, 0, queued_w, CHUNK_PROGRESS_HEIGHT
+                )
+                chunk_progress_canvas.coords(
+                    chunk_bar_done, 0, 0, done_w, CHUNK_PROGRESS_HEIGHT
                 )
 
             after_id = root.after(LEVEL_UPDATE_MS, update_level)
@@ -680,7 +678,7 @@ def record_with_gui(
         stream.stop()
         stream.close()
 
-    log.debug(
+    logger.debug(
         "recording ended: chunks=%d, callback_count=%d, cancelled=%s",
         len(chunks),
         callback_count[0],
@@ -695,156 +693,8 @@ def record_with_gui(
 
     audio_data = np.concatenate(chunks, axis=0)
     duration = len(audio_data) / SAMPLE_RATE
-    log.info("Captured %.1fs of audio.", duration)
+    logger.info("Captured %.1fs of audio.", duration)
     return audio_data, root
-
-
-def save_wav_to(audio_data: np.ndarray, path: str) -> None:
-    """Save audio data to a WAV file at the given path."""
-    with wave.open(path, "wb") as wf:
-        wf.setnchannels(AUDIO_CHANNELS)
-        wf.setsampwidth(AUDIO_SAMPLE_WIDTH)
-        wf.setframerate(SAMPLE_RATE)
-        wf.writeframes(audio_data.tobytes())
-
-
-def save_wav(audio_data: np.ndarray) -> str:
-    """Save audio to a temporary WAV file. Returns the path."""
-    file_id = uuid.uuid4().hex[:8]
-    wav_path = os.path.join(tempfile.gettempdir(), f"claude_voice_{file_id}.wav")
-    save_wav_to(audio_data, wav_path)
-    return wav_path
-
-
-def transcribe_with_progress(
-    wav_path: str,
-    *,
-    root: tk.Tk,
-    model_size: str = DEFAULT_MODEL_SIZE,
-    audio_duration: float = 0.0,
-    transcribe_ratio: float | None = None,
-) -> str:
-    """Run transcription with a tkinter progress window.
-
-    Reuses an existing tk.Tk root (from record_with_gui) to avoid creating
-    a second Tcl interpreter, which causes Tcl_AsyncDelete crashes on
-    Windows. Clears the existing widgets and replaces them with progress UI.
-
-    The root is destroyed when transcription completes or fails.
-
-    Returns the transcript text.
-    """
-    # Clear recording widgets, reuse the same window
-    for widget in root.winfo_children():
-        widget.destroy()
-
-    frame = tk.Frame(root, padx=20, pady=15)
-    frame.pack()
-
-    status_label = tk.Label(
-        frame,
-        text="Transcribing...",
-        font=FONT_STATUS,
-        fg=COLOR_TRANSCRIBING,
-    )
-    status_label.pack(pady=(0, 5))
-
-    # Estimate row
-    est_frame = tk.Frame(frame)
-    est_frame.pack(pady=(0, 5))
-
-    elapsed_var = tk.StringVar(value="0:00")
-    est_var = tk.StringVar()
-    has_estimate = transcribe_ratio is not None and audio_duration > 0
-    if has_estimate and transcribe_ratio is not None:
-        est_total = int(audio_duration * transcribe_ratio)
-        est_m, est_s = divmod(est_total, 60)
-        est_var.set(f"~{est_m}:{est_s:02d}")
-
-    tk.Label(est_frame, text="Elapsed:", font=FONT_DETAIL, fg=COLOR_MUTED).grid(
-        row=0, column=0, sticky="w", padx=(0, 5)
-    )
-    tk.Label(est_frame, textvariable=elapsed_var, font=FONT_DETAIL).grid(
-        row=0, column=1, sticky="e"
-    )
-    if has_estimate:
-        tk.Label(est_frame, text="Est:", font=FONT_DETAIL, fg=COLOR_MUTED).grid(
-            row=0, column=2, sticky="w", padx=(10, 5)
-        )
-        tk.Label(
-            est_frame, textvariable=est_var, font=FONT_DETAIL, fg=COLOR_MUTED
-        ).grid(row=0, column=3, sticky="e")
-
-    # Progress bar
-    progress_canvas = tk.Canvas(
-        frame,
-        width=PROGRESS_BAR_WIDTH,
-        height=PROGRESS_BAR_HEIGHT,
-        bg=PROGRESS_BG_COLOR,
-        highlightthickness=0,
-    )
-    progress_canvas.pack(pady=(5, 10))
-    progress_bar = progress_canvas.create_rectangle(
-        0, 0, 0, PROGRESS_BAR_HEIGHT, fill=PROGRESS_COLOR, width=0
-    )
-
-    percent_var = tk.StringVar(value="0%")
-    tk.Label(frame, textvariable=percent_var, font=FONT_DETAIL, fg=COLOR_MUTED).pack()
-
-    # Shared state between threads
-    progress_fraction = [0.0]
-    transcription_result: list[str | None] = [None]
-    transcription_error: list[Exception | None] = [None]
-    transcription_done = threading.Event()
-    t_start = time.time()
-
-    def on_progress(fraction: float) -> None:
-        progress_fraction[0] = fraction
-
-    def run_transcription() -> None:
-        try:
-            result = transcribe_wav(
-                wav_path,
-                model_size=model_size,
-                progress_callback=on_progress,
-            )
-            transcription_result[0] = result
-        except Exception as e:
-            transcription_error[0] = e
-        finally:
-            transcription_done.set()
-
-    def update_ui() -> None:
-        # Update elapsed time
-        elapsed = int(time.time() - t_start)
-        mins, secs = divmod(elapsed, 60)
-        elapsed_var.set(f"{mins}:{secs:02d}")
-
-        # Update progress bar
-        frac = progress_fraction[0]
-        bar_width = int(frac * PROGRESS_BAR_WIDTH)
-        progress_canvas.coords(progress_bar, 0, 0, bar_width, PROGRESS_BAR_HEIGHT)
-        percent_var.set(f"{int(frac * 100)}%")
-
-        if transcription_done.is_set():
-            root.destroy()
-        else:
-            root.after(PROGRESS_UPDATE_MS, update_ui)
-
-    # Prevent closing the window from killing transcription
-    root.protocol("WM_DELETE_WINDOW", lambda: None)
-
-    thread = threading.Thread(target=run_transcription, daemon=True)
-    thread.start()
-    update_ui()
-    root.mainloop()
-
-    thread.join(timeout=5)
-
-    if transcription_error[0] is not None:
-        raise transcription_error[0]
-
-    return transcription_result[0] or ""
 
 
 def main() -> None:
@@ -893,24 +743,32 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    log_level = logging.DEBUG if args.debug else logging.INFO
     handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
-    log.addHandler(handler)
-    log.setLevel(logging.DEBUG if args.debug else logging.INFO)
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+    # Configure our loggers only — avoid flooding with third-party debug spam
+    for name in ("voice", "whisper", "chunks"):
+        mod_logger = logging.getLogger(name)
+        mod_logger.addHandler(handler)
+        mod_logger.setLevel(log_level)
+    logger.addHandler(handler)
+    logger.setLevel(log_level)
 
     if args.list_devices:
         devices = _get_input_devices()
         if not devices:
-            log.error("No input devices found.")
+            logger.error("No input devices found.")
             sys.exit(EXIT_ERROR)
         for dev in devices:
-            log.info("  %d: %s", dev["id"], dev["name"])
+            logger.info("  %d: %s", dev["id"], dev["name"])
         sys.exit(EXIT_SUCCESS)
 
     # --wav-input: transcribe-only mode (no recording, no lock, no GUI)
     if args.wav_input:
         if not os.path.exists(args.wav_input):
-            log.error("WAV file not found: %s", args.wav_input)
+            logger.error("WAV file not found: %s", args.wav_input)
             sys.exit(EXIT_ERROR)
         start_whisper_preload()
         t_start = time.time()
@@ -921,19 +779,21 @@ def main() -> None:
                 audio_duration = wf.getnframes() / wf.getframerate()
         except Exception:
             audio_duration = 0.0
-        log.info(
+        logger.info(
             "Transcribed %.1fs audio in %.1fs (model=%s)",
             audio_duration,
             t_elapsed,
             args.model,
         )
-        print(transcript)
+        print("[BEGIN]")
+        print(_sanitize_transcript(transcript))
+        print("[END]")
         sys.exit(EXIT_SUCCESS)
 
     try:
         _acquire_lock()
     except LockAcquireError as e:
-        log.error("%s", e)
+        logger.error("%s", e)
         sys.exit(EXIT_ERROR)
 
     try:
@@ -944,8 +804,17 @@ def main() -> None:
 
         # Create chunk manager for background transcription during recording
         chunk_mgr = ChunkManager(model_size=args.model)
+        begun = [False]  # track whether [BEGIN] has been printed
+
         if args.stream:
-            chunk_mgr.set_stream_callback(lambda text: print(text, flush=True))
+
+            def _stream_chunk(text: str) -> None:
+                if not begun[0]:
+                    print("[BEGIN]", flush=True)
+                    begun[0] = True
+                print(_sanitize_transcript(text), flush=True)
+
+            chunk_mgr.set_stream_callback(_stream_chunk)
         chunk_mgr.start_worker()
 
         gui_root: tk.Tk | None = None
@@ -957,10 +826,12 @@ def main() -> None:
                 chunk_manager=chunk_mgr,
             )
         except RecordingCancelled:
+            # In stream mode, [BEGIN] + chunks may already be on stdout.
+            # [CANCEL] terminates the block (or stands alone if no [BEGIN]).
             print("[CANCEL]")
             sys.exit(EXIT_SUCCESS)
         except RecordingError as e:
-            log.error("%s", e)
+            logger.error("%s", e)
             sys.exit(EXIT_ERROR)
 
         # GUI handled "Transcribing..." phase — root is already quit
@@ -975,18 +846,23 @@ def main() -> None:
         if args.wav_output:
             wav_path = os.path.abspath(args.wav_output)
             save_wav_to(audio_data, wav_path)
-            log.info("Saved audio to %s", wav_path)
+            logger.info("Saved audio to %s", wav_path)
 
         transcript = chunk_mgr.get_transcript()
 
         if not transcript:
-            print("[DONE]")
-            log.warning("No speech detected in audio.")
+            print("[BEGIN]")
+            print("[END]")
+            logger.warning("No speech detected in audio.")
             sys.exit(EXIT_SUCCESS)
 
-        print("[DONE]")
-        if not args.stream:
-            print(transcript)
+        if args.stream:
+            # Chunks already streamed with [BEGIN] prefix
+            print("[END]")
+        else:
+            print("[BEGIN]")
+            print(_sanitize_transcript(transcript))
+            print("[END]")
     finally:
         _release_lock()
 
