@@ -36,8 +36,8 @@ class SilenceDetector:
     def __init__(
         self,
         threshold: float = 0.08,
-        duration_s: float = 1.0,
-        min_chunk_s: float = 1.0,
+        duration_s: float = 2.0,
+        min_chunk_s: float = 15.0,
         buffer_s: float = 0.5,
         callback_interval_s: float = 0.01,
     ):
