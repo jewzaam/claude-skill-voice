@@ -59,8 +59,8 @@ coverage: install-dev  ## Run pytest with coverage
 run:  ## Run voice.py using the venv Python
 	$(PYTHON) scripts/voice.py
 
-run-debug:  ## Run voice.py with --stream --debug, stderr to debug.log (mirrors SKILL.md)
-	$(PYTHON) scripts/voice.py --stream --debug 2>~/.config/claude-skill-voice/debug.log
+run-debug:  ## Run voice.py with --stream --debug to file (mirrors SKILL.md)
+	$(PYTHON) scripts/voice.py --stream --debug ~/.config/claude-skill-voice/debug.log
 
 help:  ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}'
