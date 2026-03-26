@@ -755,13 +755,24 @@ def main() -> None:
     )
     parser.add_argument(
         "--debug",
-        action="store_true",
-        help="Enable debug logging to stderr",
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="LOGFILE",
+        help="Enable debug logging. Optionally specify a file path to write "
+        "to instead of stderr. The directory will be created if needed.",
     )
     args = parser.parse_args()
 
     log_level = logging.DEBUG if args.debug else logging.INFO
-    handler = logging.StreamHandler(sys.stderr)
+    handler: logging.Handler
+    if args.debug and args.debug is not True:
+        # --debug given a filename: write to file, create dir if needed
+        log_path = os.path.abspath(os.path.expanduser(args.debug))
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+    else:
+        handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(
         logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
     )
